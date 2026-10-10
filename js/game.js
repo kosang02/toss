@@ -16,6 +16,7 @@ const INERTIA = 0.8;                 // 회전 관성 계수 (질량 × 이 값)
 export const ISLAND_R = 22 * K;      // 섬 크기
 const FIRE_RANGE = 38 * K;           // 내 대포 사거리
 const BALL_SPEED = 26 * K;           // 내 포탄 속도
+const MAGNET_R = 10 * K;             // 상자 자석 범위
 // 선체별 사격 범위 상자 [중심 옆거리, 옆 폭, 앞뒤 길이] (원작 단위)
 const ATK_BOX = [[9, 15, 4], [9, 15, 4], [9, 15, 4.92], [10, 15, 5.57], [10, 15, 5.6], [10, 16, 6.6], [10, 16, 6.8], [10.5, 17, 7.41], [10.5, 17, 8.88], [11, 19, 10]];
 
@@ -1069,6 +1070,17 @@ export class Game {
       l.obj.position.y = Math.sin(this.t * 2 + l.x) * 0.5;
       l.obj.rotation.y += dt;
       if (l.t > (l.gift ? 120 : 60) || Math.hypot(p.x - l.x, p.z - l.z) > 100 * K) { this.world.remove(l.obj); this.loot.splice(i, 1); continue; }
+      // 자석: 배 근처(원작 단위 10)의 상자는 배 쪽으로 끌려온다
+      if (!p.dead && this.parked == null) {
+        const d = Math.hypot(p.x - l.x, p.z - l.z);
+        const R = MAGNET_R + p.len * 0.5;
+        if (d < R) {
+          l.pull = (l.pull || 0) + dt;
+          const sp = Math.min(d, (30 + l.pull * 120) * dt);
+          l.x += (p.x - l.x) / d * sp; l.z += (p.z - l.z) / d * sp;
+          l.obj.position.x = l.x; l.obj.position.z = l.z;
+        } else l.pull = 0;
+      }
       if (!p.dead && this.parked == null && p.contains(l.x, l.z, 2 * K)) {
         this.collectLoot(l);
         this.world.remove(l.obj); this.loot.splice(i, 1);

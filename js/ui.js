@@ -166,13 +166,10 @@ export class UI {
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     const R = size / 2;
     c.clearRect(0, 0, size, size);
-    const grd = c.createRadialGradient(R, R, 0, R, R, R);
-    grd.addColorStop(0, 'rgba(14,52,80,0.92)'); grd.addColorStop(1, 'rgba(4,16,28,0.95)');
-    c.fillStyle = grd;
-    c.beginPath(); c.arc(R, R, R - 3, 0, Math.PI * 2); c.fill();
-    c.strokeStyle = '#c9993f'; c.lineWidth = 4; c.stroke();
-    c.strokeStyle = 'rgba(0,0,0,0.6)'; c.lineWidth = 1.5; c.beginPath(); c.arc(R, R, R - 6, 0, Math.PI * 2); c.stroke();
-    c.fillStyle = '#ffe39a'; c.font = 'bold 10px sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillStyle = 'rgba(13,18,25,0.9)';
+    c.beginPath(); c.arc(R, R, R - 2, 0, Math.PI * 2); c.fill();
+    c.strokeStyle = 'rgba(255,255,255,0.14)'; c.lineWidth = 1.5; c.stroke();
+    c.fillStyle = '#8b939e'; c.font = 'bold 9px sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
     c.fillText('N', R, 5); c.fillText('S', R, size - 5); c.fillText('W', 5, R); c.fillText('E', size - 5, R);
     const k = (R - 12) / (80 * D.K);
     c.save();
@@ -386,7 +383,7 @@ export class UI {
       const H = D.MAP_R;
       const k = size / (H * 2);
       P = (x, z) => [(x + H) * k, (z + H) * k];
-      c.fillStyle = '#0b2f4a'; c.fillRect(0, 0, size, size);
+      c.fillStyle = '#0d1d2b'; c.fillRect(0, 0, size, size);
       c.strokeStyle = 'rgba(255,255,255,0.12)';
       for (const r of [300, 600, 900, 1200, 1500, 1800]) { c.beginPath(); c.arc(size / 2, size / 2, r * D.K * k, 0, Math.PI * 2); c.stroke(); }
       c.strokeStyle = 'rgba(255,255,255,0.4)'; c.beginPath(); c.arc(size / 2, size / 2, H * k, 0, Math.PI * 2); c.stroke();
