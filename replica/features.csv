@@ -1,0 +1,26 @@
+feature,area,priority,original,clone,notes
+3D sea with low-poly ship and top-down angled camera,world,must,yes,yes,
+Drag-to-steer with teardrop indicator,controls,must,yes,yes,
+Double-tap to keep sailing,controls,should,yes,yes,
+Broadside cannons auto-fire at targets in arc,combat,must,yes,yes,
+Enemy ships of several tiers that chase and shoot,combat,must,yes,yes,
+Loot drops from sunk ships,combat,must,yes,yes,
+Islands with defending fleets; capture on clearing,islands,must,yes,yes,
+Dock at captured island opens menu,islands,must,yes,yes,
+Dock tab: repair + 5 upgrade tracks (body caps others),upgrade,must,yes,yes,
+Market tab: 6 goods with per-island prices/stock and timed reset,trade,must,yes,yes,
+Resource HUD (coins + 6 goods),ui,must,yes,yes,
+Fishing near own island,fishing,must,yes,yes,
+Sink -> respawn at last island losing cargo,progress,must,yes,yes,
+Local save,progress,must,yes,yes,
+Compass minimap,ui,should,yes,yes,
+Assistant tab: helpers that follow and shoot; seagull heal; Nessy max HP,assistants,should,yes,yes,
+Arena wave survival with best record,arena,should,yes,yes,
+Second ocean unlocked after first,world,should,yes,yes,
+Dokdo final island and Kraken/octopus boss,world,should,yes,yes,
+Whale shadows and seagulls ambience,world,could,yes,yes,
+World map screen,ui,could,yes,yes,
+Hold to auto buy/sell,trade,could,yes,yes,
+Store tab with real-money gems,store,could,yes,skip,no payments in a personal rebuild
+Google Play leaderboards,social,could,yes,skip,needs the original's Play account
+Rewarded video ads,store,could,yes,skip,no ads
