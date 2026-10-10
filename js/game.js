@@ -1213,15 +1213,15 @@ export class Game {
     const p = this.player, s = this.state;
     if (this.parked != null || p.dead || this.arena) return;
     const dist0 = Math.hypot(p.x, p.z);
+    // 원작 GenPirate: 섬 근처가 아니면 1~(max-1)척 시도, 다음 대기는 생성 후 해적 수 기준
     this.pirateT -= dt;
     if (this.pirateT <= 0) {
-      const pirates = this.enemies.filter(e => e.pirate && !e.dead).length;
-      this.pirateT = 5 + pirates * 5;
       if (!this.nearIsland) {
         const max = dist0 < 500 * K ? 2 : dist0 < 900 * K ? 3 : 4;
-        const n = 1 + Math.floor(Math.random() * (max - 1));
-        for (let i = 0; i < n; i++) this.genPirate();
+        // 원작 반복문은 매번 난수를 다시 뽑는다: for (i = 0; i < Random.Range(1, max); i++)
+        for (let i = 0; i < 1 + Math.floor(Math.random() * (max - 1)); i++) this.genPirate();
       }
+      this.pirateT = 5 + this.enemies.filter(e => e.pirate && !e.dead).length * 5;
     }
     // 독도: 150 안이면 10초마다 Lv10 해적이 몰려온다
     if (s.world === 0 && Math.hypot(p.x - D.DOKDO.x, p.z - D.DOKDO.z) < 150 * K) {
@@ -1251,7 +1251,8 @@ export class Game {
     const p = this.player, s = this.state;
     let n = D.pirateTier(Math.hypot(p.x, p.z), s.world);
     if (this.enemies.filter(e => e.pirate && !e.dead).length >= n + 2) return;
-    const gx = p.x + Math.sin(p.heading) * 15 * K, gz = p.z + Math.cos(p.heading) * 15 * K;
+    // 원작: 배 앞쪽 100 지점(genPos) 둘레 20에서 생성
+    const gx = p.x + Math.sin(p.heading) * 100 * K, gz = p.z + Math.cos(p.heading) * 100 * K;
     let x, z;
     do { x = rand(-20, 20) * K; z = rand(-20, 20) * K; } while (Math.hypot(x, z) < 20 * K);
     if (Math.random() < 1 / 200) n = 6;
