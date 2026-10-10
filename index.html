@@ -178,7 +178,50 @@ button { font-family: var(--font); cursor: pointer; }
 #titleBtns #btnNew.second { background: rgba(255,255,255,0.2); box-shadow: none; }
 #title .hint { margin-top: 22px; font-size: 13px; opacity: 0.85; line-height: 1.6; }
 #title .credit { position: absolute; bottom: calc(10px + var(--safe-b)); font-size: 11px; opacity: 0.6; padding: 0 12px; }
-body.menuopen #topRight, body.menuopen #hpWrap, body.menuopen #banner { display: none; }
+
+#title { cursor: pointer; }
+#touchStart { margin-top: 40px; font-family: var(--title); font-size: 24px; animation: blink 1.4s infinite; text-shadow: 0 2px 4px rgba(0,0,0,0.5); }
+@keyframes blink { 50% { opacity: 0.35; } }
+.res.ticket { margin-top: 4px; }
+#fishing { position: absolute; left: 50%; bottom: calc(30px + var(--safe-b)); transform: translateX(-50%); background: rgba(20,90,60,0.8); padding: 6px 16px; border-radius: 16px; font-weight: 700; font-size: 14px; display: none; }
+#fishing.show { display: block; animation: pop .25s; }
+#pointer { position: absolute; display: none; flex-direction: column; align-items: center; transform: translate(-50%, -50%); pointer-events: none; }
+#pointer i { font-style: normal; font-size: 30px; color: #ffd84a; text-shadow: 0 0 6px rgba(0,0,0,0.6); display: block; }
+#pointer span { font-size: 11px; font-weight: 700; background: rgba(0,0,0,0.45); padding: 1px 6px; border-radius: 8px; white-space: nowrap; }
+#menuRepair { color: #bff5c9; font-weight: 700; }
+.gauge { position: relative; height: 6px; background: rgba(255,255,255,0.12); border-radius: 3px; margin: 4px 0 2px; overflow: hidden; max-width: 180px; }
+.gauge i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
+.gauge .maxg { background: rgba(255,255,255,0.25); }
+.gauge .cur { background: var(--gold); }
+.rbtn.up { min-width: 92px; }
+.flags { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin: 10px 0; }
+.flag { border: 3px solid #dfe8f0; background: #fff; border-radius: 12px; padding: 6px; display: flex; flex-direction: column; align-items: center; gap: 4px; font-weight: 700; color: #1a3550; }
+.flag:active, .flag:hover { border-color: #1580c9; }
+.flag canvas { border-radius: 6px; }
+.tuto { display: flex; flex-direction: column; gap: 8px; text-align: left; }
+.tuto div { background: #e3edf5; border-radius: 10px; padding: 8px 12px; display: flex; flex-direction: column; }
+.tuto b { color: #14406a; }
+.tuto span { font-size: 13px; color: #3b5670; }
+.capflag { display: flex; justify-content: center; gap: 18px; margin: 6px 0; }
+.capflag .from { animation: flipout 1.2s forwards; }
+.capflag .to { animation: flipin 1.2s forwards; }
+@keyframes flipout { 0%, 50% { transform: scaleX(1); opacity: 1; } 75% { transform: scaleX(0); opacity: 0.3; } 100% { transform: scaleX(0.6); opacity: 0.25; } }
+@keyframes flipin { 0%, 60% { transform: scaleX(0); } 85% { transform: scaleX(1.15); } 100% { transform: scaleX(1); } }
+.capflag canvas { border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.25); }
+.islname { font-family: var(--title); font-size: 22px; color: #14406a; margin: 4px 0 !important; }
+.chips.big .chip { font-size: 16px; padding: 4px 10px; }
+.daily { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+.day { background: #e3edf5; border-radius: 10px; padding: 6px 2px; display: flex; flex-direction: column; align-items: center; font-weight: 700; font-size: 13px; gap: 2px; }
+.day small { font-size: 10px; color: #5d7690; }
+.day.got { opacity: 0.45; }
+.day.on { background: #ffe9a8; box-shadow: 0 0 0 2px #f0a400; }
+.kills { font-family: var(--title); font-size: 40px; color: #c0392b; margin: 0 !important; }
+.btn small { display: block; font-size: 11px; font-weight: 400; opacity: 0.8; }
+.btn:disabled { opacity: 0.45; }
+.btns.col .btn { width: 100%; }
+.a-pickup { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath d='M2 12 L18 12 L15 16 L5 16 Z' fill='%23f2c230'/%3E%3Ccircle cx='10' cy='7' r='3' fill='%23a0693a'/%3E%3C/svg%3E"); }
+
+body.menuopen #topRight, body.menuopen #hpWrap, body.menuopen #banner, body.menuopen #pointer, body.menuopen #fishing { display: none !important; }
 body.intitle #hud, body.intitle #worldLayer { display: none; }
 #noWebgl { display: none; position: fixed; inset: 0; z-index: 50; background: #1d6a93; align-items: center; justify-content: center; text-align: center; padding: 24px; font-size: 16px; }
 
@@ -218,19 +261,19 @@ body.intitle #hud, body.intitle #worldLayer { display: none; }
   </div>
   <div id="toasts"></div>
   <div id="context">
-    <button class="cbtn" id="btnDock">⚓ 정박하기</button>
-    <button class="cbtn" id="btnFish"><span>낚시</span><i id="fishProg"></i></button>
     <button class="cbtn" id="btnArena">⚔ 아레나 입장</button>
   </div>
+  <div id="fishing">🎣 낚시 중</div>
+  <div id="pointer"><i>➤</i><span></span></div>
 </div>
 
 <div id="islandMenu">
   <div id="menuTop">
-    <div><div id="menuName"></div><div id="menuStat"><span id="menuCoins"></span><span id="menuCargo"></span></div></div>
+    <div><div id="menuName"></div><div id="menuStat"><span id="menuCoins"></span><span id="menuRepair"></span></div></div>
     <button id="btnUndock">출항 »</button>
   </div>
   <div id="menuTabs">
-    <button class="mtab on" data-tab="dock">정박소</button>
+    <button class="mtab on" data-tab="dock">선착장</button>
     <button class="mtab" data-tab="market">시장</button>
     <button class="mtab" data-tab="assist">조수</button>
   </div>
@@ -245,12 +288,9 @@ body.intitle #hud, body.intitle #worldLayer { display: none; }
     <h1>독도까지</h1>
     <div class="subt">배 키우기</div>
   </div>
-  <div id="titleBtns">
-    <button class="cbtn" id="btnContinue">이어하기</button>
-    <button class="cbtn" id="btnNew">출항하기</button>
-  </div>
-  <div class="hint">바다를 누른 채 끌어서 항해 · 적을 배 옆에 두면 자동 포격<br>섬을 점령하고 배를 키워 독도까지!</div>
-  <div class="credit">2017년 Zzoo의 모바일 게임 「DOKDO」를 기억하며 다시 만든 비공식 팬 제작 게임입니다.</div>
+  <div id="touchStart">터치해서 시작하기</div>
+  <div class="hint">경고 : 브라우저 데이터를 지우면 저장이 사라질 수 있습니다.</div>
+  <div class="credit">2017년 Zzoo의 모바일 게임 「DOKDO」의 규칙을 분석해 다시 만든 비공식 팬 제작 게임입니다. 그림과 소리는 새로 만들었습니다.</div>
 </div>
 <div id="noWebgl">이 브라우저에서는 3D(WebGL)를 쓸 수 없어 게임을 실행할 수 없습니다.<br>최신 Chrome, Safari, Edge에서 열어 주세요.</div>
 

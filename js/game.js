@@ -1,20 +1,27 @@
+// 게임 본체. 규칙과 수치는 원작 분석(replica/original-system.md)을 따른다.
 import * as THREE from './three.module.min.js';
 import * as D from './data.js';
 import * as M from './models.js';
 import { UI } from './ui.js';
 import { Sound } from './audio.js';
 
+const K = D.K;
 const TAU = Math.PI * 2;
-const wrap = a => { while (a > Math.PI) a -= TAU; while (a < -Math.PI) a += TAU; return a; };
+const DEG = Math.PI / 180;
+const wrap = a => { a = (a + Math.PI) % TAU; if (a < 0) a += TAU; return a - Math.PI; };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const dist2 = (ax, az, bx, bz) => (ax - bx) ** 2 + (az - bz) ** 2;
+const lerp = (a, b, t) => a + (b - a) * Math.min(1, t);
 const rand = (a, b) => a + Math.random() * (b - a);
-const ARENA_CENTER = { x: 0, z: 2700 };
-const ARENA_R = 230;
+const INERTIA = 0.8;                 // 회전 관성 계수 (질량 × 이 값)
+export const ISLAND_R = 22 * K;      // 섬 크기
+// 선체별 사격 범위 상자 [중심 옆거리, 옆 폭, 앞뒤 길이] (원작 단위)
+const ATK_BOX = [[9, 15, 4], [9, 15, 4], [9, 15, 4.92], [10, 15, 5.57], [10, 15, 5.6], [10, 16, 6.6], [10, 16, 6.8], [10.5, 17, 7.41], [10.5, 17, 8.88], [11, 19, 10]];
 
-// ---------- 파티클 ----------
+M.setSailSets(D.SAIL_SET);
+
+// ---------- 파티클 (정사영용) ----------
 class Particles {
-  constructor(scene, max = 2500) {
+  constructor(scene, max = 3000) {
     this.max = max;
     this.list = [];
     const g = new THREE.BufferGeometry();
@@ -26,11 +33,11 @@ class Particles {
     g.setAttribute('color', new THREE.BufferAttribute(this.col, 3).setUsage(THREE.DynamicDrawUsage));
     g.setAttribute('size', new THREE.BufferAttribute(this.size, 1).setUsage(THREE.DynamicDrawUsage));
     g.setAttribute('alpha', new THREE.BufferAttribute(this.alpha, 1).setUsage(THREE.DynamicDrawUsage));
-    this.uniforms = { scale: { value: 600 } };
+    this.uniforms = { scale: { value: 5 } };
     const m = new THREE.ShaderMaterial({
       uniforms: this.uniforms,
       vertexShader: `attribute float size; attribute float alpha; attribute vec3 color; varying vec3 vC; varying float vA; uniform float scale;
-        void main(){ vC=color; vA=alpha; vec4 mv=modelViewMatrix*vec4(position,1.0); gl_PointSize=size*scale/-mv.z; gl_Position=projectionMatrix*mv; }`,
+        void main(){ vC=color; vA=alpha; gl_PointSize=size*scale; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
       fragmentShader: `varying vec3 vC; varying float vA; void main(){ vec2 d=gl_PointCoord-0.5; float r=length(d); if(r>0.5) discard; gl_FragColor=vec4(vC, vA*smoothstep(0.5,0.25,r)); }`,
       transparent: true, depthWrite: false,
     });
@@ -42,11 +49,7 @@ class Particles {
   emit(o) {
     if (this.list.length >= this.max) return;
     const c = new THREE.Color(o.color ?? 0xffffff);
-    this.list.push({
-      x: o.x, y: o.y ?? 0.5, z: o.z, vx: o.vx ?? 0, vy: o.vy ?? 0, vz: o.vz ?? 0,
-      life: o.life ?? 1, max: o.life ?? 1, size: o.size ?? 2, grow: o.grow ?? 0,
-      r: c.r, g: c.g, b: c.b, a: o.alpha ?? 1, grav: o.grav ?? 0, drag: o.drag ?? 0,
-    });
+    this.list.push({ x: o.x, y: o.y ?? 0.5, z: o.z, vx: o.vx ?? 0, vy: o.vy ?? 0, vz: o.vz ?? 0, life: o.life ?? 1, max: o.life ?? 1, size: o.size ?? 2, grow: o.grow ?? 0, r: c.r, g: c.g, b: c.b, a: o.alpha ?? 1, grav: o.grav ?? 0, drag: o.drag ?? 0 });
   }
   update(dt) {
     const L = this.list;
@@ -73,6 +76,89 @@ class Particles {
   }
 }
 
+// ---------- 배 물리 ----------
+class Ship {
+  constructor(game, o) {
+    this.game = game;
+    this.x = o.x; this.z = o.z;
+    this.vx = 0; this.vz = 0;
+    this.heading = o.heading ?? 0;
+    this.omega = 0;
+    this.v = 0; this.v2 = 0; this.s = 0; this.s0 = 0;
+    this.d = 0; this.e = 0;
+    this.obj = new THREE.Group();
+    game.world.add(this.obj);
+  }
+  setSpec({ mass, motor, steer, drag, angDrag, len, beam }) {
+    Object.assign(this, { mass, motor, steer, drag, angDrag, len, beam });
+  }
+  setModel(model) {
+    while (this.obj.children.length) this.obj.remove(this.obj.children[0]);
+    this.model = model;
+    this.obj.add(model);
+    this.refl = M.makeReflection(model);
+    this.obj.add(this.refl);
+  }
+  // 원작 FixedUpdate의 힘/토크 적용 방식을 따른다
+  physics(dt, vRate) {
+    this.v2 = lerp(this.v2, this.v, vRate * dt);
+    const torque = this.s * 5;
+    this.omega += torque / (this.mass * INERTIA) * dt;
+    this.omega *= Math.max(0, 1 - this.angDrag * dt);
+    this.omega = clamp(this.omega, -7, 7);
+    this.heading = wrap(this.heading - this.omega * dt);
+    const a = this.v2 * 10 / this.mass * K;
+    this.vx += Math.sin(this.heading) * a * dt;
+    this.vz += Math.cos(this.heading) * a * dt;
+    const k = Math.max(0, 1 - this.drag * dt);
+    this.vx *= k; this.vz *= k;
+    this.x += this.vx * dt; this.z += this.vz * dt;
+    this.d = lerp(this.d, this.s0 * 0.2 * (this.v2 / this.motor), 0.5 * dt);
+    this.e = lerp(this.e, -this.v * 0.01, 0.5 * dt);
+  }
+  // 목표 방향으로 조타량 계산 (원작: s = steerForce × 계수 × 각도차(도))
+  steerTo(desired, coef) {
+    this.s0 = -wrap(desired - this.heading) / DEG;
+    this.s = this.steer * coef * this.s0;
+  }
+  speed() { return Math.hypot(this.vx, this.vz); }
+  render(t) {
+    this.obj.position.x = this.x; this.obj.position.z = this.z;
+    if (!this.dead) this.obj.position.y = Math.sin(t * 1.6 + this.x * 0.01) * 0.25;
+    this.obj.rotation.y = this.heading;
+    if (this.model) {
+      this.model.rotation.z = clamp(this.d, -10, 10) * DEG * 0.8;
+      this.model.rotation.x = clamp(this.e * 0.5, -5, 5) * DEG;
+      if (this.refl) { this.refl.rotation.copy(this.model.rotation); this.refl.visible = !this.dead; }
+      const oars = this.model.userData.oars;
+      if (oars) for (const o of oars) o.piv.rotation.y = Math.sin(t * (2 + this.speed() * 0.05) + o.ph) * 0.5 * Math.min(1, this.speed() / 10) * o.side;
+    }
+  }
+  // 로컬 좌표 (lx: 오른쪽 +, lz: 앞 +)
+  toLocal(px, pz) {
+    const dx = px - this.x, dz = pz - this.z, c = Math.cos(this.heading), s = Math.sin(this.heading);
+    return { lx: dx * c - dz * s, lz: dx * s + dz * c };
+  }
+  toWorld(lx, lz) {
+    const c = Math.cos(this.heading), s = Math.sin(this.heading);
+    return { x: this.x + lx * c + lz * s, z: this.z - lx * s + lz * c };
+  }
+  contains(px, pz, margin = 0) {
+    const { lx, lz } = this.toLocal(px, pz);
+    return Math.abs(lx) < this.beam / 2 + margin && Math.abs(lz) < this.len / 2 + margin;
+  }
+  // 사격 범위 상자 안이면 -1(왼쪽) / 1(오른쪽), 아니면 0
+  inAtkBox(px, pz, body) {
+    const [c, w, l] = ATK_BOX[clamp(body, 1, 10) - 1];
+    const { lx, lz } = this.toLocal(px, pz);
+    if (Math.abs(lz) > (l / 2 + 3) * K) return 0;
+    if (Math.abs(lx - c * K) < (w / 2 + 1.5) * K) return 1;
+    if (Math.abs(lx + c * K) < (w / 2 + 1.5) * K) return -1;
+    return 0;
+  }
+  dispose() { this.game.world.remove(this.obj); }
+}
+
 // ---------- 게임 ----------
 export class Game {
   constructor(canvas) {
@@ -81,139 +167,169 @@ export class Game {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.scene = new THREE.Scene();
-    this.bg = new THREE.Color(0x1d6a93);
-    this.scene.background = this.bg;
-    this.scene.fog = new THREE.Fog(0x2a7ea8, 260, 700);
-    this.camera = new THREE.PerspectiveCamera(40, 1, 1, 3000);
-    this.zoom = 1;
-    this.zoomTarget = 1;
+    this.scene.background = new THREE.Color(0x1d6a93);
+    this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 4000);
+    this.camSize = 15;
+    this.camSizeTarget = 15;
 
-    const hemi = new THREE.HemisphereLight(0xdff2ff, 0x2a5a78, 1.15);
-    this.scene.add(hemi);
+    this.scene.add(new THREE.HemisphereLight(0xdff2ff, 0x2a5a78, 1.1));
     const sun = new THREE.DirectionalLight(0xffffff, 1.6);
-    sun.position.set(-60, 120, 40);
+    sun.position.set(0, 39.2, 35.4); // 원작: 남쪽 위에서 45도
     this.scene.add(sun);
 
     this.makeWater();
     this.particles = new Particles(this.scene);
     this.world = new THREE.Group();
     this.scene.add(this.world);
-
     this.sound = new Sound();
     this.ui = new UI(this);
+
     this.t = 0;
+    this.acc = 0;
     this.enemies = [];
-    this.balls = [];
+    this.bullets = [];
     this.loot = [];
     this.islands = [];
-    this.warnings = [];
+    this.krakens = [];
+    this.helpers = [];
+    this.near = [];
     this.paused = true;
-    this.input = { active: false, heading: 0, sx: 0, sy: 0, cx: 0, cy: 0, keys: new Set(), lastTap: 0, lastTapX: 0, lastTapY: 0, pinch: null };
-    this.cruise = false;
+    this.input = { touch: false, heading: 0, sx: 0, sy: 0, cx: 0, cy: 0, keys: new Set(), lastTap: 0, pinch: null, moved: false };
+    this.auto = false;
+    this.parked = null;
     this.arena = null;
-    this.fishing = null;
-    this.docked = null;
-    this.saveTimer = 0;
-    this.hudTimer = 0;
-    this.spawnTimer = 0;
+    this.fishT = 0;
+    this.tempFish = 0;
+    this.pirateT = 10;
+    this.dokdoT = 10;
+    this.giftT = 300;
+    this.saveT = 0;
+    this.hudT = 0;
+    this.healT = 0;
+    this.seaHealT = 0;
+    this.lootQueue = [];
+    this.lootQueueT = 0;
 
-    this.ballGeo = new THREE.SphereGeometry(0.75, 6, 5);
-    this.ballMat = M.mat(0x1b1b1f);
-    this.inkMat = M.mat(0x6a2a7a);
-
+    this.bulletGeo = new THREE.SphereGeometry(0.35 * K, 6, 5);
+    this.bulletMat = M.mat(0x1b1b1f);
     this.bindInput();
     window.addEventListener('resize', () => this.resize());
     this.resize();
     this.load();
-    this.buildOcean(this.state.ocean);
-    this.ui.showTitle(this.hasSave);
+    this.buildWorld();
+    this.ui.showTitle();
     this.last = performance.now();
     this.renderer.setAnimationLoop(() => this.frame());
   }
 
   // ---------- 저장 ----------
-  freshState() {
+  fresh() {
     return {
-      v: 1, coins: 300,
-      cargo: { fish: 4, wood: 8, ore: 0, silver: 0, gold: 0, gem: 0 },
+      v: 2, res: [500, 0, 0, 0, 0, 0, 0], revival: 3,
       lv: { body: 1, sail: 1, steer: 1, cannon: 1, fish: 1 },
-      assistants: { escort: 0, seagull: 0, nessy: 0, dolphin: 0 },
-      captured: { p0: true }, ocean: 0, lastIsland: 'p0', unlocked: [true, false],
-      arenaBest: [0, 0], markets: {}, dokdo: false,
-      stats: { kills: 0, deaths: 0, fished: 0, time: 0 },
-      hp: null, pos: null,
+      assist: [0, 0, 0], gulls: [0, 0], nessy: 0, pickup: false,
+      done: { 0: true, 28: true }, world: 0, last: 0, lastByWorld: [0, 28], target: 1,
+      emblem: -1, hp: 40, tuto: false,
+      market: {}, marketReset: Date.now() + D.MARKET_RESET * 1000,
+      best: [0, 0], deaths: 0, kills: 0, fished: 0, time: 0,
+      day: 0, lastDay: '', lastTime: Date.now(), dokdoVisited: false, italyNotice: false,
     };
   }
   load() {
-    this.hasSave = false;
     let s = null;
     try { s = JSON.parse(localStorage.getItem(D.SAVE_KEY) || 'null'); } catch (e) { s = null; }
-    const f = this.freshState();
-    if (s && s.v === 1) {
-      this.hasSave = true;
-      this.state = { ...f, ...s, cargo: { ...f.cargo, ...s.cargo }, lv: { ...f.lv, ...s.lv }, assistants: { ...f.assistants, ...s.assistants }, stats: { ...f.stats, ...s.stats } };
-    } else this.state = f;
-    this.stats = D.playerStats(this.state.lv, this.state.assistants);
+    const f = this.fresh();
+    this.hasSave = !!(s && s.v === 2);
+    this.state = this.hasSave ? { ...f, ...s, lv: { ...f.lv, ...s.lv } } : f;
   }
   save() {
-    if (!this.player) return;
     const s = this.state;
-    s.hp = this.player.hp;
-    if (!this.arena && !this.player.sinking) s.pos = { x: this.player.x, z: this.player.z, h: this.player.heading };
-    try { localStorage.setItem(D.SAVE_KEY, JSON.stringify(s)); } catch (e) { /* 저장 불가 환경 */ }
+    if (this.player) s.hp = Math.max(1, Math.round(this.player.hp));
+    s.lastTime = Date.now();
+    try { localStorage.setItem(D.SAVE_KEY, JSON.stringify(s)); } catch (e) { /* 저장 불가 */ }
   }
-  resetSave() {
-    try { localStorage.removeItem(D.SAVE_KEY); } catch (e) { /* */ }
-    location.reload();
-  }
+  resetSave() { try { localStorage.removeItem(D.SAVE_KEY); } catch (e) { /* */ } location.reload(); }
   exportSave() { this.save(); return btoa(unescape(encodeURIComponent(JSON.stringify(this.state)))); }
   importSave(str) {
     const s = JSON.parse(decodeURIComponent(escape(atob(str.trim()))));
-    if (!s || s.v !== 1) throw new Error('bad');
+    if (!s || s.v !== 2) throw new Error('bad');
     localStorage.setItem(D.SAVE_KEY, JSON.stringify(s));
     location.reload();
   }
 
-  start(fresh) {
-    if (fresh) {
-      this.state = this.freshState();
-      this.stats = D.playerStats(this.state.lv, this.state.assistants);
-      this.buildOcean(0);
-    }
+  maxHp() { return D.maxHp(this.state.lv.body, this.state.nessy); }
+  seagullHeal() { return Math.floor(this.maxHp() * (this.state.gulls[0] + this.state.gulls[1]) * 0.003); }
+
+  start() {
     this.paused = false;
+    this.last = performance.now();
     document.body.classList.remove('intitle');
     this.sound.unlock();
+    this.offlineCatchUp();
     this.ui.updateHud(true);
-    if (fresh) {
-      this.ui.toast('바다를 누른 채 끌면 그 방향으로 항해합니다', 'info', 4500);
-      setTimeout(() => this.ui.toast('적 배 옆구리를 향하면 대포가 자동으로 발사돼요', 'info', 4500), 4800);
+    this.dailyCheck();
+  }
+
+  // 꺼둔 동안: 정박 중이면 회복(최대 10분), 5분 넘으면 재접속 보상
+  offlineCatchUp() {
+    const s = this.state;
+    const sec = Math.floor((Date.now() - (s.lastTime || Date.now())) / 1000);
+    if (sec > 0 && this.parked != null) {
+      const n = Math.min(600, sec);
+      this.player.hp = Math.min(this.maxHp(), this.player.hp + D.healPoint(this.maxHp(), s.lv.body) * n * 0.5);
     }
+    if (sec > 300 && s.tuto) {
+      const min = Math.floor(Math.min(43200, sec) / 60);
+      const coins = min * s.lv.fish * 3;
+      if (coins > 0) this.pendingReReward = { min, coins };
+    }
+  }
+  dailyCheck() {
+    const s = this.state;
+    if (!s.tuto) return;
+    const today = new Date().toDateString();
+    if (s.lastDay !== today) {
+      s.day = s.day >= 10 ? 1 : s.day + 1;
+      s.lastDay = today;
+      this.ui.showDaily(s.day, () => {
+        const r = D.DAILY[s.day - 1];
+        if (r.revival) s.revival += r.revival; else s.res[r.res] += r.n;
+        this.sound.play('fanfare', 0.5);
+        this.save();
+        this.ui.updateHud(true);
+        if (this.pendingReReward) this.showReReward();
+      });
+    } else if (this.pendingReReward) this.showReReward();
+  }
+  showReReward() {
+    const r = this.pendingReReward;
+    this.pendingReReward = null;
+    this.ui.showReReward(r, () => { this.addRes(0, r.coins); this.save(); });
   }
 
   // ---------- 바다 ----------
   makeWater() {
-    const size = 2600;
+    const size = 3000;
     this.waterTex = M.waterTexture();
     this.waterTex.wrapS = this.waterTex.wrapT = THREE.RepeatWrapping;
-    this.waterRepeat = 20;
+    this.waterRepeat = 18;
     this.waterTex.repeat.set(this.waterRepeat, this.waterRepeat);
     const geo = new THREE.PlaneGeometry(size, size);
     geo.rotateX(-Math.PI / 2);
-    this.water = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: this.waterTex, transparent: true, opacity: 0.8, fog: true }));
+    this.water = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: this.waterTex, transparent: true, opacity: 0.8 }));
     this.water.renderOrder = 1;
     this.scene.add(this.water);
     this.causTex = M.causticTexture();
     this.causTex.wrapS = this.causTex.wrapT = THREE.RepeatWrapping;
-    this.causRepeat = 34;
+    this.causRepeat = 30;
     this.causTex.repeat.set(this.causRepeat, this.causRepeat);
-    this.caustic = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: this.causTex, transparent: true, opacity: 0.55, depthWrite: false, blending: THREE.AdditiveBlending }));
-    this.caustic.position.y = 0.05;
+    this.caustic = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: this.causTex, transparent: true, opacity: 0.5, depthWrite: false, blending: THREE.AdditiveBlending }));
     this.caustic.renderOrder = 2;
     this.scene.add(this.caustic);
     this.waterSize = size;
   }
   updateWater(cx, cz) {
-    const snap = 50;
+    const snap = 40;
     const x = Math.round(cx / snap) * snap, z = Math.round(cz / snap) * snap;
     this.water.position.set(x, 0, z);
     this.caustic.position.set(x, 0.05, z);
@@ -221,161 +337,155 @@ export class Game {
     this.waterTex.offset.set(x / tile + this.t * 0.004, -z / tile + this.t * 0.002);
     const ct = this.waterSize / this.causRepeat;
     this.causTex.offset.set(x / ct - this.t * 0.012, -z / ct + this.t * 0.007);
-    this.caustic.material.opacity = 0.42 + Math.sin(this.t * 0.9) * 0.12;
+    this.caustic.material.opacity = 0.4 + Math.sin(this.t * 0.9) * 0.12;
   }
 
-  // ---------- 월드 구성 ----------
-  clearWorld() {
-    for (const e of this.enemies) this.world.remove(e.obj);
-    for (const b of this.balls) this.scene.remove(b.mesh);
+  // ---------- 월드 ----------
+  decoFor(isl) {
+    const special = { 'Black & White': 'chess', CATS: 'cat', WHALEs: 'whale', 'The Tower': 'lighthouse', Crater: 'volcano', 'Ice Americano': 'ice', ChristMas: 'ice', PISA: 'lighthouse', 'Big Fountain': 'flower', 'Little Fountain': 'flower', Liberty: 'moai', 'Red Castle': 'skull', OCTO: 'skull' };
+    if (special[isl.name]) return special[isl.name];
+    if (isl.world === 1) return ['village', 'windmill', 'village', 'moai'][isl.i % 4];
+    return ['village', 'palms', 'palms', 'ice', 'flower'][isl.fac];
+  }
+
+  buildWorld() {
+    for (const e of this.enemies) e.dispose();
+    for (const b of this.bullets) this.scene.remove(b.mesh);
     for (const l of this.loot) this.world.remove(l.obj);
-    for (const w of this.warnings) this.scene.remove(w.mesh);
-    this.enemies = []; this.balls = []; this.loot = []; this.warnings = [];
+    this.enemies = []; this.bullets = []; this.loot = [];
     while (this.world.children.length) this.world.remove(this.world.children[0]);
     this.islands = [];
-    this.ambient = null;
-  }
-
-  buildOcean(oceanId) {
-    this.clearWorld();
     const s = this.state;
-    s.ocean = oceanId;
-    const ocean = D.OCEANS[oceanId];
-    const home = ocean.islands.find(i => i.home);
-    s.captured[home.id] = true;
-    for (const def of ocean.islands) {
-      const obj = M.makeIsland(def);
-      obj.position.set(def.x, 0, def.z);
-      const container = new THREE.Group();
-      container.add(obj);
-      const refl = M.makeReflection(obj);
-      refl.position.copy(obj.position);
-      container.add(refl);
-      this.world.add(container);
-      const isl = {
-        def, obj, refl, x: def.x, z: def.z, radius: obj.userData.radius,
-        dock: { x: def.x + obj.userData.dockOffset.x, z: def.z + obj.userData.dockOffset.z },
-        defenders: [], engaged: false,
-      };
-      M.setIslandOwned(obj, !!s.captured[def.id]);
-      M.setIslandOwned(refl, !!s.captured[def.id]);
-      this.islands.push(isl);
+    const em = Math.max(0, s.emblem);
+    const dockDir = Math.atan2(-0.75, 0.66); // 원작처럼 섬 남서쪽
+    for (const isl of D.ISLANDS) {
+      if (isl.world !== s.world) continue;
+      const obj = M.makeIsland({ id: 'isl' + isl.i, r: ISLAND_R / 1.15, deco: this.decoFor(isl), ground: D.FACTIONS[isl.fac].ground });
+      obj.position.set(isl.x, 0, isl.z);
+      if (obj.userData.dockGroup) obj.userData.dockGroup.rotation.y = dockDir;
+      this.world.add(obj);
+      const refl = M.makeReflection(obj); refl.position.copy(obj.position); this.world.add(refl);
+      const dock = { x: isl.x + Math.sin(dockDir) * (ISLAND_R + 20), z: isl.z + Math.cos(dockDir) * (ISLAND_R + 20) };
+      const rec = { def: isl, obj, refl, x: isl.x, z: isl.z, dock, defenders: [], gen: false };
+      M.setIslandOwned(obj, !!s.done[isl.i], em, isl.fac);
+      M.setIslandOwned(refl, !!s.done[isl.i], em, isl.fac);
+      const fog = new THREE.Mesh(new THREE.CircleGeometry(ISLAND_R * 2.2, 24), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, depthWrite: false }));
+      fog.rotation.x = -Math.PI / 2; fog.position.set(isl.x, 30, isl.z); fog.renderOrder = 6;
+      this.world.add(fog);
+      rec.fog = fog;
+      this.islands.push(rec);
     }
-    // 아레나 입구
+    if (s.world === 0) {
+      const dk = M.makeIsland({ id: 'dokdo', r: ISLAND_R * 0.9, deco: 'dokdo', ground: 0x5f9a45 });
+      dk.position.set(D.DOKDO.x, 0, D.DOKDO.z);
+      if (dk.userData.dockGroup) dk.userData.dockGroup.visible = false;
+      this.world.add(dk);
+      const dr = M.makeReflection(dk); dr.position.copy(dk.position); this.world.add(dr);
+    }
+    // 아레나
+    const A = D.ARENAS[s.world];
+    this.arenaPos = A;
     const gate = M.makeArenaGate();
-    gate.position.set(ocean.arena.x, 0, ocean.arena.z);
+    gate.scale.setScalar(1.4);
+    gate.position.set(A.x, 0, A.z + 250);
     this.world.add(gate);
-    const gr = M.makeReflection(gate); gr.position.copy(gate.position); this.world.add(gr);
-    this.gate = { x: ocean.arena.x, z: ocean.arena.z, obj: gate };
-    // 아레나 부표
-    for (let i = 0; i < 28; i++) {
-      const a = i / 28 * TAU;
+    this.gateObj = gate;
+    for (let i = 0; i < 40; i++) {
+      const a = i / 40 * TAU;
       const b = M.makeBuoy(i % 2 ? 0xd8342c : 0xf4f4f4);
-      b.position.set(ARENA_CENTER.x + Math.cos(a) * ARENA_R, 0, ARENA_CENTER.z + Math.sin(a) * ARENA_R);
+      b.scale.setScalar(1.5);
+      b.position.set(A.x + Math.cos(a) * 215, 0, A.z + Math.sin(a) * 215);
       this.world.add(b);
     }
-    // 고래 그림자, 갈매기
+    // 크라켄
+    this.krakens = [];
+    if (s.world === 0) for (const k of D.KRAKENS) {
+      const obj = M.makeKraken();
+      obj.scale.setScalar(0.7);
+      obj.position.set(k.x, -40, k.z);
+      obj.visible = false;
+      this.world.add(obj);
+      this.krakens.push({ x: k.x, z: k.z, obj, state: 'hidden', t: 0, cool: 0 });
+    }
     this.whales = [];
     for (let i = 0; i < 3; i++) {
       const w = M.makeWhaleShadow();
-      w.position.set(rand(-800, 800), -0.6, rand(-800, 800));
       w.userData.h = rand(0, TAU);
       this.world.add(w);
       this.whales.push(w);
     }
     this.gulls = [];
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 4; i++) {
       const g = M.makeSeagull();
-      g.userData.phase = rand(0, TAU); g.userData.r = rand(30, 70); g.userData.h = rand(26, 40);
+      g.scale.setScalar(1.6);
+      g.userData.phase = rand(0, TAU); g.userData.r = rand(40, 80); g.userData.h = rand(30, 45);
       this.world.add(g);
       this.gulls.push(g);
     }
-
-    if (!this.player) this.createPlayer();
-    else this.world.add(this.player.obj);
-    this.createAssistants();
-
-    // 시작 위치
-    const last = this.islands.find(i => i.def.id === s.lastIsland) || this.islands.find(i => i.def.home);
-    if (s.pos && !this.started) {
-      this.player.x = s.pos.x; this.player.z = s.pos.z; this.player.heading = s.pos.h ?? Math.PI;
-    } else this.placeAtDock(last);
-    this.player.hp = s.hp != null && !this.started ? Math.min(s.hp, this.stats.maxHp) : this.stats.maxHp;
-    if (this.player.hp <= 0) this.player.hp = this.stats.maxHp;
-    this.started = true;
-    this.camTarget = new THREE.Vector3(this.player.x, 0, this.player.z);
-    this.ui && this.ui.updateHud(true);
+    if (!this.player) {
+      this.player = new Ship(this, { x: 0, z: 0 });
+      this.player.hp = s.hp;
+    } else this.world.add(this.player.obj);
+    this.applyLevels(true);
+    for (const w of this.whales) w.position.set(this.player.x + rand(-600, 600), -0.6, this.player.z + rand(-600, 600));
+    this.park(s.last, true);
   }
 
-  placeAtDock(isl) {
-    const p = this.player;
-    p.x = isl.dock.x + 12; p.z = isl.dock.z - 2; p.heading = 0; p.speed = 0;
-    this.state.lastIsland = isl.def.id;
+  applyLevels(force) {
+    const s = this.state, p = this.player, L = s.lv;
+    const [len, beam] = D.HULL[L.body - 1];
+    p.setSpec({ mass: D.shipMass(L.body), motor: D.motorForce(L.body, L.sail), steer: D.steerForce(L.body, L.steer), drag: 2, angDrag: 4, len: len * K, beam: beam * K });
+    const key = [L.body, L.sail, L.steer, s.emblem].join(',');
+    if (force || key !== p.lookKey) {
+      p.lookKey = key;
+      const look = M.boatLook({ body: L.body, sail: L.sail, steer: L.steer, emblem: Math.max(0, s.emblem), hulls: D.HULL, K });
+      const model = M.makeShip({ ...look, guns: D.TURRETS[L.body - 1] / 2 });
+      p.setModel(model);
+      p.turrets = model.userData.slots.map(sl => ({ side: sl.side, lx: sl.x, lz: sl.z, t: 0.5 }));
+    }
+    const mh = this.maxHp();
+    if (p.hp == null) p.hp = mh;
+    p.hp = Math.min(p.hp, mh);
   }
 
-  createPlayer() {
-    const p = { x: 0, z: 0, heading: Math.PI, speed: 0, hp: 100, cd: { '-1': 0, '1': 0 }, lastCombat: -99, lookTier: -1, wakeT: 0 };
-    p.obj = new THREE.Group();
-    this.player = p;
-    this.rebuildPlayerShip();
-    this.world.add(p.obj);
-  }
-
-  rebuildPlayerShip() {
-    const p = this.player;
-    const look = M.playerShipLook(this.state.lv.body);
-    const guns = this.stats.guns;
-    if (look.tier === p.lookTier && guns === p.guns) return;
-    p.lookTier = look.tier; p.guns = guns;
-    while (p.obj.children.length) p.obj.remove(p.obj.children[0]);
-    const model = M.makeShip({ ...look, guns });
-    p.model = model;
-    p.radius = model.userData.radius;
-    p.obj.add(model);
-    p.refl = M.makeReflection(model);
-    p.obj.add(p.refl);
-  }
-
-  createAssistants() {
-    if (this.assist) for (const k in this.assist) if (this.assist[k]) this.world.remove(this.assist[k].obj);
-    this.assist = {};
-    const a = this.state.assistants;
-    const p = this.player;
-    if (a.escort > 0) {
-      const obj = new THREE.Group();
-      const m = M.makeShip({ len: 9, masts: 1, sail: 0xe4ecf6, emblem: 'crest', hull: 0x8b5a2b, band: 0x1e2340, trim: 0xe8c02e, guns: 1 });
-      obj.add(m); obj.add(M.makeReflection(m));
-      obj.position.set(p.x - 15, 0, p.z - 10);
-      this.world.add(obj);
-      this.assist.escort = { obj, model: m, x: p.x - 15, z: p.z - 10, h: p.heading, cd: 0 };
+  setupHelpers() {
+    for (const h of this.helpers) h.ship ? h.ship.dispose() : this.world.remove(h.obj);
+    this.helpers = [];
+    const s = this.state, p = this.player;
+    s.assist.forEach((lv, i) => {
+      if (lv <= 0) return;
+      const L = Math.min(50, lv);
+      const b = clamp(Math.floor(L * 0.2) + 1, 1, 10);
+      const a = p.heading + Math.PI + (i - 1) * 0.6;
+      const ship = new Ship(this, { x: p.x + Math.sin(a) * 50, z: p.z + Math.cos(a) * 50, heading: p.heading });
+      const [len, beam] = D.HULL[b - 1];
+      ship.setSpec({ mass: (500 + b * 100) * 0.5, motor: 500 + L * 25, steer: (300 + L * 70) * 0.5, drag: 3, angDrag: 4, len: len * K, beam: beam * K });
+      const look = M.boatLook({ body: b, sail: L, steer: L, emblem: Math.max(0, s.emblem), hulls: D.HULL, K });
+      ship.setModel(M.makeShip({ ...look, guns: D.TURRETS[b - 1] / 2 }));
+      ship.atk = Math.floor(0.5 * (5 + L * 2));
+      ship.cd = { '-1': 0, 1: 0 };
+      ship.body = b;
+      this.helpers.push({ kind: 'ship', ship, idx: i });
+    });
+    s.gulls.forEach((lv, i) => {
+      if (lv <= 0) return;
+      const g = M.makeSeagull();
+      g.scale.setScalar((0.2 + 0.036 * lv) * K * 1.6);
+      this.world.add(g);
+      this.helpers.push({ kind: 'gull', obj: g, phase: i * Math.PI });
+    });
+    if (s.nessy > 0) {
+      const n = M.makeNessy();
+      n.scale.setScalar((0.2 + 0.036 * s.nessy) * K * 0.7);
+      this.world.add(n);
+      this.helpers.push({ kind: 'nessy', obj: n, x: p.x, z: p.z, h: p.heading });
     }
-    if (a.seagull > 0) {
-      const obj = new THREE.Group();
-      const gs = [];
-      for (let i = 0; i < 2; i++) { const g = M.makeSeagull(); g.userData.phase = i * Math.PI; obj.add(g); gs.push(g); }
-      this.world.add(obj);
-      this.assist.seagull = { obj, gs };
+    if (s.pickup) {
+      const ship = new Ship(this, { x: p.x, z: p.z + 40, heading: p.heading });
+      ship.setSpec({ mass: 300, motor: 900, steer: 400, drag: 3, angDrag: 4, len: 3.5 * K, beam: 1.2 * K });
+      ship.setModel(M.makeShip({ len: 3.5 * K, beam: 1.5 * K, depth: 0.8 * K, masts: 1, sail: 0xf2c230, emblem: 'none', hull: 0xf2c230, trim: 0xffffff, guns: 0, oars: 1 }));
+      this.helpers.push({ kind: 'pickup', ship, target: null });
     }
-    if (a.nessy > 0) {
-      const obj = M.makeNessy();
-      this.world.add(obj);
-      this.assist.nessy = { obj, x: p.x, z: p.z, h: p.heading };
-    }
-    if (a.dolphin > 0) {
-      const obj = M.makeDolphin();
-      this.world.add(obj);
-      this.assist.dolphin = { obj, t: 0 };
-    }
-  }
-
-  refreshStats() {
-    const oldMax = this.stats.maxHp;
-    this.stats = D.playerStats(this.state.lv, this.state.assistants);
-    if (this.player) {
-      this.player.hp = Math.min(this.stats.maxHp, this.player.hp + Math.max(0, this.stats.maxHp - oldMax));
-      this.rebuildPlayerShip();
-    }
-    this.ui.updateHud(true);
   }
 
   // ---------- 입력 ----------
@@ -387,28 +497,26 @@ export class Game {
       pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (pts.size === 2) {
         const [a, b] = [...pts.values()];
-        this.input.pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), z: this.zoomTarget };
-        this.input.active = false;
+        this.input.pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), z: this.camSizeTarget };
+        this.input.touch = false;
         this.ui.steer(null);
         return;
       }
-      if (this.paused || this.docked) return;
-      const now = performance.now();
+      if (this.paused || this.parked != null || this.player.dead) return;
       const I = this.input;
-      if (now - I.lastTap < 450 && Math.hypot(e.clientX - I.lastTapX, e.clientY - I.lastTapY) < 60) {
-        // 두 번 탭: 그 방향으로 계속 항해
-        const sp = this.shipScreen();
-        const dx = e.clientX - sp.x, dy = e.clientY - sp.y;
-        this.cruiseHeading = Math.hypot(dx, dy) > 30 ? Math.atan2(dx, dy) : this.player.heading;
-        this.cruise = true;
+      const now = performance.now();
+      if (now - I.lastTap < 500) {
+        // 두 번 탭: 화면 중심에서 탭한 방향으로 자동 항해
+        I.heading = Math.atan2(e.clientX - this.vw / 2, e.clientY - this.vh / 2);
+        this.auto = true;
         I.lastTap = 0;
-        I.active = false;
-        this.ui.toast('계속 항해 중 · 다시 끌면 직접 조종', 'info', 1600);
-        return;
+        this.ui.toast('자동 항해', 'info', 1200);
+      } else {
+        this.auto = false;
+        I.lastTap = now;
       }
-      I.lastTap = now; I.lastTapX = e.clientX; I.lastTapY = e.clientY;
-      I.active = true; I.sx = e.clientX; I.sy = e.clientY; I.cx = e.clientX; I.cy = e.clientY;
-      I.moved = false;
+      I.touch = true; I.moved = false;
+      I.sx = e.clientX; I.sy = e.clientY; I.cx = e.clientX; I.cy = e.clientY;
     });
     c.addEventListener('pointermove', e => {
       if (!pts.has(e.pointerId)) return;
@@ -416,29 +524,24 @@ export class Game {
       const I = this.input;
       if (I.pinch && pts.size >= 2) {
         const [a, b] = [...pts.values()];
-        const d = Math.hypot(a.x - b.x, a.y - b.y);
-        this.zoomTarget = clamp(I.pinch.z * I.pinch.d / d, 0.6, 2.4);
+        this.camSizeTarget = clamp(I.pinch.z * I.pinch.d / Math.hypot(a.x - b.x, a.y - b.y), 6, this.maxCam());
         return;
       }
-      if (!I.active) return;
+      if (!I.touch) return;
       I.cx = e.clientX; I.cy = e.clientY;
       const dx = I.cx - I.sx, dy = I.cy - I.sy;
-      if (Math.hypot(dx, dy) > 10) {
-        I.heading = Math.atan2(dx, dy);
-        I.moved = true;
-        this.cruise = false;
-      }
+      if (Math.hypot(dx, dy) > 8) { I.heading = Math.atan2(dx, dy); I.moved = true; this.auto = false; }
     });
     const up = e => {
       pts.delete(e.pointerId);
       if (pts.size < 2) this.input.pinch = null;
-      if (pts.size === 0) { this.input.active = false; this.ui.steer(null); }
+      if (pts.size === 0) { this.input.touch = false; this.ui.steer(null); }
     };
     c.addEventListener('pointerup', up);
     c.addEventListener('pointercancel', up);
     c.addEventListener('wheel', e => {
       e.preventDefault();
-      this.zoomTarget = clamp(this.zoomTarget * (e.deltaY > 0 ? 1.1 : 0.9), 0.6, 2.4);
+      this.camSizeTarget = clamp(this.camSizeTarget * (e.deltaY > 0 ? 1.1 : 0.9), 6, this.maxCam());
     }, { passive: false });
     window.addEventListener('keydown', e => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
@@ -447,39 +550,61 @@ export class Game {
     });
     window.addEventListener('keyup', e => this.input.keys.delete(e.key.toLowerCase()));
     window.addEventListener('blur', () => this.input.keys.clear());
+    document.addEventListener('visibilitychange', () => { if (document.hidden) this.save(); });
   }
-
-  shipScreen() {
-    const v = new THREE.Vector3(this.player.x, 2, this.player.z).project(this.camera);
-    const r = this.canvas.getBoundingClientRect();
-    return { x: (v.x + 1) / 2 * r.width + r.left, y: (1 - v.y) / 2 * r.height + r.top };
-  }
+  maxCam() { return this.vw > this.vh ? 22 : 40; }
 
   toScreen(x, y, z) {
     const v = new THREE.Vector3(x, y, z).project(this.camera);
-    if (v.z > 1) return null;
+    if (v.z > 1 || v.z < -1) return null;
     return { x: (v.x + 1) / 2 * this.vw, y: (1 - v.y) / 2 * this.vh };
   }
 
   resize() {
-    const w = window.innerWidth, h = window.innerHeight;
-    this.vw = w; this.vh = h;
-    this.renderer.setSize(w, h, false);
-    this.camera.aspect = w / h;
-    // 세로 화면에서는 시야를 넓힌다
-    this.camera.fov = w < h ? 52 : 40;
-    this.camera.updateProjectionMatrix();
-    this.particles.uniforms.scale.value = h * this.renderer.getPixelRatio() / (2 * Math.tan(this.camera.fov * Math.PI / 360));
+    this.vw = window.innerWidth; this.vh = window.innerHeight;
+    this.renderer.setSize(this.vw, this.vh, false);
+    this.camSizeTarget = Math.min(this.camSizeTarget, this.maxCam());
   }
 
-  // ---------- 메인 루프 ----------
+  // ---------- 루프 ----------
   frame() {
     const now = performance.now();
-    let dt = (now - this.last) / 1000;
+    const dt = Math.min(0.1, (now - this.last) / 1000);
     this.last = now;
-    dt = Math.min(dt, 0.05);
+    if (!this.paused) {
+      this.acc += dt;
+      let steps = 0;
+      while (this.acc >= D.DT && steps < 6) { this.step(D.DT); this.acc -= D.DT; steps++; }
+      if (steps === 6) this.acc = 0;
+    }
+    this.renderAll(dt);
+  }
+
+  step(dt) {
     this.t += dt;
-    if (!this.paused) this.update(dt);
+    this.state.time += dt;
+    this.updatePlayer(dt);
+    this.updateEnemies(dt);
+    this.updateHelpers(dt);
+    this.updateBullets(dt);
+    this.updateIslands(dt);
+    this.updateLoot(dt);
+    this.updateSpawners(dt);
+    this.updateKrakens(dt);
+    this.updateArena(dt);
+    this.saveT += dt;
+    if (this.saveT > 5) { this.saveT = 0; this.save(); }
+    this.hudT += dt;
+    if (this.hudT > 0.25) { this.hudT = 0; this.ui.updateHud(); }
+  }
+
+  renderAll(dt) {
+    const p = this.player;
+    if (p) {
+      p.render(this.t);
+      for (const e of this.enemies) e.render(this.t);
+      for (const h of this.helpers) if (h.ship) h.ship.render(this.t);
+    }
     this.updateCamera(dt);
     this.updateAmbience(dt);
     this.particles.update(dt);
@@ -487,919 +612,766 @@ export class Game {
     if (!this.paused) this.ui.frame(dt);
   }
 
-  update(dt) {
-    this.state.stats.time += dt;
-    this.updatePlayer(dt);
-    this.updateEnemies(dt);
-    this.updateBalls(dt);
-    this.updateWarnings(dt);
-    this.updateLoot(dt);
-    this.updateIslands(dt);
-    this.updateSpawns(dt);
-    this.updateAssistants(dt);
-    this.updateFishing(dt);
-    this.updateArena(dt);
-    this.saveTimer += dt;
-    if (this.saveTimer > 5) { this.saveTimer = 0; this.save(); }
-    this.hudTimer += dt;
-    if (this.hudTimer > 0.25) { this.hudTimer = 0; this.ui.updateHud(); }
-  }
-
-  // ---------- 플레이어 ----------
+  // ---------- 내 배 ----------
   updatePlayer(dt) {
-    const p = this.player, st = this.stats, I = this.input;
-    if (p.sinking) {
-      p.sinkT += dt;
-      p.obj.position.y = -p.sinkT * 3;
-      p.model.rotation.z = Math.min(1.2, p.sinkT * 0.6);
-      p.refl.visible = false;
+    const p = this.player, I = this.input, s = this.state;
+    if (p.dead) {
+      p.obj.position.y = Math.max(-20 * K, p.obj.position.y - dt * 8);
       return;
     }
-    let desired = p.heading, throttle = 0;
-    // 키보드
-    const K = I.keys;
+    if (this.parked != null) {
+      // 부두로 천천히 이동 (원작: 5초)
+      const isl = this.islands.find(i => i.def.i === this.parked);
+      if (isl) {
+        p.x = lerp(p.x, isl.dock.x, dt * 0.8);
+        p.z = lerp(p.z, isl.dock.z, dt * 0.8);
+        p.heading = wrap(p.heading + wrap(Math.PI * 0.75 - p.heading) * Math.min(1, dt));
+      }
+      p.vx = p.vz = 0; p.omega = 0; p.v = p.v2 = 0; p.s = 0; p.s0 = 0;
+      // 정박 중 회복: 2초마다
+      this.healT += dt;
+      if (this.healT > 2) {
+        this.healT = 0;
+        if (p.hp < this.maxHp()) { p.hp = Math.min(this.maxHp(), p.hp + Math.max(1, D.healPoint(this.maxHp(), s.lv.body))); this.ui.updateHud(true); }
+      }
+      return;
+    }
+    const KS = I.keys;
     let kx = 0, kz = 0;
-    if (K.has('arrowup') || K.has('w')) kz -= 1;
-    if (K.has('arrowdown') || K.has('s')) kz += 1;
-    if (K.has('arrowleft') || K.has('a')) kx -= 1;
-    if (K.has('arrowright') || K.has('d')) kx += 1;
-    if (this.docked) {
-      const isl = this.islands.find(i => i.def.id === this.docked);
-      const tx = isl.dock.x + 12, tz = isl.dock.z - 2;
-      p.x += (tx - p.x) * Math.min(1, dt * 2);
-      p.z += (tz - p.z) * Math.min(1, dt * 2);
-      p.heading += wrap(0 - p.heading) * Math.min(1, dt * 2);
-      p.speed = 0;
-    } else {
-      if (kx || kz) { desired = Math.atan2(kx, kz); throttle = 1; this.cruise = false; }
-      else if (I.active && I.moved) { desired = I.heading; throttle = 1; }
-      else if (this.cruise) { desired = this.cruiseHeading; throttle = 1; }
-      if (this.fishing) throttle = 0;
-      const diff = wrap(desired - p.heading);
-      const turn = st.turn * dt * (0.6 + 0.4 * Math.min(1, p.speed / st.speed + 0.3));
-      p.heading = wrap(p.heading + clamp(diff, -turn, turn));
-      const target = st.speed * throttle * (Math.abs(diff) > 1.6 ? 0.55 : 1);
-      p.speed += (target - p.speed) * Math.min(1, dt * (throttle ? 0.9 : 0.7));
-      p.x += Math.sin(p.heading) * p.speed * dt;
-      p.z += Math.cos(p.heading) * p.speed * dt;
-      p.turnDiff = diff;
-      this.collideIslands(p);
-      // 경계
-      if (this.arena) {
-        const dx = p.x - ARENA_CENTER.x, dz = p.z - ARENA_CENTER.z, d = Math.hypot(dx, dz);
-        const lim = ARENA_R - p.radius - 4;
-        if (d > lim) { p.x = ARENA_CENTER.x + dx / d * lim; p.z = ARENA_CENTER.z + dz / d * lim; }
-      } else {
-        const lim = D.OCEAN_HALF;
-        if (Math.abs(p.x) > lim || Math.abs(p.z) > lim) {
-          if (!this.edgeWarned) { this.ui.toast('더 이상 나아갈 수 없습니다', 'warn', 1500); this.edgeWarned = true; }
-        } else this.edgeWarned = false;
-        p.x = clamp(p.x, -lim, lim); p.z = clamp(p.z, -lim, lim);
-      }
-      if (I.active && I.moved) this.ui.steer(I);
-      else this.ui.steer(null);
+    if (KS.has('arrowup') || KS.has('w')) kz -= 1;
+    if (KS.has('arrowdown') || KS.has('s')) kz += 1;
+    if (KS.has('arrowleft') || KS.has('a')) kx -= 1;
+    if (KS.has('arrowright') || KS.has('d')) kx += 1;
+    let go = (I.touch && I.moved) || this.auto;
+    let desired = I.heading;
+    if (kx || kz) { go = true; desired = Math.atan2(kx, kz); this.auto = false; }
+    if (go) { p.v = p.motor; p.steerTo(desired, 0.01); } else { p.v = 0; p.s = 0; p.s0 = 0; }
+    p.physics(dt, 1);
+    this.ui.steer(I.touch && I.moved ? I : null);
+    this.collideIslands(p);
+    if (this.parked != null) return;
+    // 맵 끝을 넘으면 반대편으로
+    if (Math.hypot(p.x, p.z) > D.MAP_R && !this.arena) {
+      p.x = -p.x * 0.9; p.z = -p.z * 0.9;
+      this.camTarget.set(p.x, 0, p.z);
+      this.ui.toast('세계의 끝을 넘어 반대편으로 나왔습니다', 'info', 2500);
     }
-    // 표현
-    p.obj.position.set(p.x, Math.sin(this.t * 1.6) * 0.15, p.z);
-    p.obj.rotation.y = p.heading;
-    p.model.rotation.z = clamp(-(p.turnDiff || 0) * 0.12, -0.12, 0.12) * Math.min(1, p.speed / 8) + Math.sin(this.t * 1.3) * 0.02;
-    p.model.rotation.x = Math.sin(this.t * 1.1) * 0.015;
-    p.refl.rotation.copy(p.model.rotation);
-    // 항적
-    p.wakeT -= dt;
-    if (p.speed > 3 && p.wakeT <= 0) {
-      p.wakeT = 0.05;
-      const L = p.model.userData.len;
-      const bx = p.x - Math.sin(p.heading) * L * 0.45, bz = p.z - Math.cos(p.heading) * L * 0.45;
-      for (const s of [-1, 1]) {
-        const sx = Math.cos(p.heading) * s * L * 0.18, sz = -Math.sin(p.heading) * s * L * 0.18;
-        this.particles.emit({ x: bx + sx, y: 0.3, z: bz + sz, vx: sx * 0.3, vz: sz * 0.3, life: 1.6, size: L * 0.2, grow: L * 0.25, color: 0xe6f6ff, alpha: 0.55 });
-      }
-      this.particles.emit({ x: p.x + Math.sin(p.heading) * L * 0.5, y: 0.4, z: p.z + Math.cos(p.heading) * L * 0.5, life: 0.6, size: L * 0.12, grow: L * 0.2, color: 0xffffff, alpha: 0.6 });
-    }
-    // 방어 함대가 없는 자기 섬 근처에서는 천천히 회복
-    if (!this.arena && this.t - p.lastCombat > 5) {
-      const near = this.islands.some(i => this.state.captured[i.def.id] && dist2(i.x, i.z, p.x, p.z) < (i.radius + 160) ** 2);
-      if (near || this.docked) p.hp = Math.min(st.maxHp, p.hp + st.maxHp * 0.006 * dt);
-    }
-    // 자동 포격
-    for (const side of [-1, 1]) {
-      p.cd[side] -= dt;
-      if (p.cd[side] > 0 || this.docked) continue;
-      const tgt = this.findTarget(p.x, p.z, p.heading, side, st.range);
-      if (tgt) {
-        p.cd[side] = st.reload;
-        this.fireBroadside(p, side, tgt, st.dmg * (1 + 0.25 * (st.guns - 1)), 'player');
-        p.lastCombat = this.t;
-      }
-    }
-  }
-
-  collideIslands(e) {
-    for (const isl of this.islands) {
-      const r = isl.radius + (e.radius || 6) * 0.7;
-      const d2 = dist2(isl.x, isl.z, e.x, e.z);
-      if (d2 < r * r) {
-        const d = Math.sqrt(d2) || 1;
-        e.x = isl.x + (e.x - isl.x) / d * r;
-        e.z = isl.z + (e.z - isl.z) / d * r;
-        e.speed *= 0.9;
-      }
-    }
-  }
-
-  findTarget(x, z, heading, side, range) {
-    let best = null, bd = range * range;
+    // 바다에서 갈매기 회복: 30초마다
+    if (p.hp < this.maxHp()) {
+      this.seaHealT += dt;
+      if (this.seaHealT > 30) { this.seaHealT = 0; const h = this.seagullHeal(); if (h > 0) { p.hp = Math.min(this.maxHp(), p.hp + h); this.ui.floatText(p.x, 30, p.z, '+' + h, '#7cf29a'); } }
+    } else this.seaHealT = 0;
+    p.wakeT = (p.wakeT || 0) - dt;
+    if (p.speed() > 2 && p.wakeT <= 0) { p.wakeT = 0.06; this.wake(p); }
+    // 포탑
+    this.near = this.enemies.filter(e => !e.dead && p.inAtkBox(e.x, e.z, s.lv.body) !== 0);
+    for (const tu of p.turrets) this.updateTurret(p, tu, dt);
+    // 들이받기: 서로 상대 선체 레벨만큼 피해
     for (const e of this.enemies) {
       if (e.dead) continue;
-      const er = e.radius;
-      const d2 = dist2(x, z, e.x, e.z);
-      if (d2 > (range + er) ** 2) continue;
-      const rel = wrap(Math.atan2(e.x - x, e.z - z) - heading);
-      if (Math.abs(wrap(rel - side * Math.PI / 2)) > 0.8) continue;
-      if (d2 < bd + er * er * 4) { bd = d2; best = e; }
-    }
-    return best;
-  }
-
-  fireBroadside(ship, side, target, volley, owner) {
-    const slots = (ship.model.userData.slots || []).filter(s => s.side === side);
-    const guns = Math.max(1, slots.length);
-    const per = volley / guns;
-    const h = ship.heading;
-    const cos = Math.cos(h), sin = Math.sin(h);
-    (slots.length ? slots : [{ x: side * 4, z: 0 }]).forEach((s, i) => {
-      setTimeout(() => {
-        if (ship.dead || (ship === this.player && ship.sinking)) return;
-        const hh = ship.heading, c2 = Math.cos(hh), s2 = Math.sin(hh);
-        const sx = ship.x + s.x * c2 + s.z * s2;
-        const sz = ship.z - s.x * s2 + s.z * c2;
-        this.spawnBall(sx, sz, target, per, owner, ship.scaleBall || 1);
-        for (let k = 0; k < 4; k++) this.particles.emit({ x: sx, y: 2.5, z: sz, vx: side * c2 * rand(2, 6), vy: rand(1, 3), vz: -side * s2 * rand(2, 6), life: 0.9, size: 3, grow: 6, color: 0xd8d8d8, alpha: 0.7, drag: 2 });
-        this.particles.emit({ x: sx, y: 2.5, z: sz, life: 0.15, size: 5, color: 0xffc040, alpha: 1 });
-      }, i * 90);
-    });
-    this.sound.play('cannon', owner === 'player' ? 0.5 : 0.25, this.soundPan(ship.x));
-  }
-
-  soundPan(x) { return clamp((x - this.player.x) / 150, -1, 1); }
-
-  spawnBall(x, z, target, dmg, owner, scale = 1, ink = false) {
-    const tx0 = target.x, tz0 = target.z;
-    const d = Math.hypot(tx0 - x, tz0 - z);
-    const dur = Math.max(0.3, d / 105);
-    const vx = Math.sin(target.heading || 0) * (target.speed || 0);
-    const vz = Math.cos(target.heading || 0) * (target.speed || 0);
-    const spread = owner === 'player' ? 1.5 : 3.5;
-    const tx = tx0 + vx * dur * 0.9 + rand(-spread, spread), tz = tz0 + vz * dur * 0.9 + rand(-spread, spread);
-    const mesh = new THREE.Mesh(this.ballGeo, ink ? this.inkMat : this.ballMat);
-    mesh.scale.setScalar(scale * (ink ? 2.2 : 1));
-    this.scene.add(mesh);
-    this.balls.push({ mesh, x0: x, z0: z, tx, tz, t: 0, dur, h: d * 0.12 + 3, dmg, owner, ink });
-  }
-
-  updateBalls(dt) {
-    for (let i = this.balls.length - 1; i >= 0; i--) {
-      const b = this.balls[i];
-      b.t += dt;
-      const k = Math.min(1, b.t / b.dur);
-      const x = b.x0 + (b.tx - b.x0) * k, z = b.z0 + (b.tz - b.z0) * k;
-      b.mesh.position.set(x, 2.5 + Math.sin(k * Math.PI) * b.h - k * 2.5, z);
-      if (k < 1) continue;
-      this.scene.remove(b.mesh);
-      this.balls.splice(i, 1);
-      this.impact(b, x, z);
-    }
-  }
-
-  impact(b, x, z) {
-    let hit = null;
-    if (b.owner === 'player' || b.owner === 'escort') {
-      for (const e of this.enemies) {
-        if (e.dead) continue;
-        if (dist2(e.x, e.z, x, z) < (e.radius + 3) ** 2) { hit = e; break; }
+      if (Math.hypot(e.x - p.x, e.z - p.z) < (p.len + e.len) * 0.5 && (p.contains(e.x, e.z, e.beam / 2) || e.contains(p.x, p.z, p.beam / 2))) {
+        const nx = e.x - p.x, nz = e.z - p.z, nd = Math.hypot(nx, nz) || 1;
+        e.vx += nx / nd * 15; e.vz += nz / nd * 15; p.vx -= nx / nd * 8; p.vz -= nz / nd * 8;
+        if ((e.ramT || 0) < this.t) {
+          e.ramT = this.t + 1;
+          this.boom((e.x + p.x) / 2, 3 * K, (e.z + p.z) / 2, 0xffa030);
+          this.hitEnemy(e, s.lv.body);
+          this.hitPlayer(e.lv);
+        }
       }
-      if (hit) this.damageEnemy(hit, b.dmg);
-    } else {
-      const p = this.player;
-      if (!p.sinking && dist2(p.x, p.z, x, z) < (p.radius + 3) ** 2) { hit = p; this.damagePlayer(b.dmg); }
     }
-    if (hit) {
-      for (let k = 0; k < 10; k++) this.particles.emit({ x, y: 3, z, vx: rand(-8, 8), vy: rand(3, 12), vz: rand(-8, 8), grav: 18, life: 0.6, size: 1.6, color: b.ink ? 0x8a3aa0 : (k % 2 ? 0xffa030 : 0x5a3a20) });
-      for (let k = 0; k < 3; k++) this.particles.emit({ x, y: 4, z, vy: 2, life: 1.2, size: 4, grow: 6, color: 0x555555, alpha: 0.6 });
-      this.sound.play('hit', 0.35, this.soundPan(x));
-    } else {
-      for (let k = 0; k < 8; k++) this.particles.emit({ x, y: 0.5, z, vx: rand(-3, 3), vy: rand(6, 14), vz: rand(-3, 3), grav: 25, life: 0.8, size: 1.8, color: 0xffffff, alpha: 0.9 });
-      this.particles.emit({ x, y: 0.3, z, life: 0.8, size: 3, grow: 10, color: 0xe6f6ff, alpha: 0.7 });
-      this.sound.play('splash', 0.2, this.soundPan(x));
+    // 자동 낚시: 점령한 섬 근처, 주변에 적이 없을 때
+    const nearOwn = this.islands.some(i => s.done[i.def.i] && Math.hypot(i.x - p.x, i.z - p.z) < D.FISH_R + ISLAND_R * 0.5);
+    this.fishing = nearOwn && !this.arena && !this.enemies.some(e => !e.dead && Math.hypot(e.x - p.x, e.z - p.z) < 30 * K);
+    if (this.fishing) {
+      this.fishT += dt;
+      if (this.fishT > 2.2) {
+        this.fishT = 0;
+        this.tempFish += 0.01;
+        const n = Math.max(1, Math.ceil((3 + 1.2 * s.lv.fish) * (1 - this.tempFish) * rand(0.8, 1.2)));
+        this.giveRes([0, n, 0, 0, 0, 0, 0]);
+        s.fished += n;
+        this.sound.play('fish', 0.35);
+        for (let k = 0; k < 6; k++) this.particles.emit({ x: p.x + rand(-8, 8), y: 1, z: p.z + rand(-8, 8), vy: rand(10, 20), grav: 40, life: 0.7, size: 1.4, color: 0xffffff });
+      }
+    } else this.fishT = 0;
+  }
+
+  wake(sh) {
+    const L = sh.len;
+    const bx = sh.x - Math.sin(sh.heading) * L * 0.45, bz = sh.z - Math.cos(sh.heading) * L * 0.45;
+    for (const sd of [-1, 1]) {
+      const sx = Math.cos(sh.heading) * sd * sh.beam * 0.4, sz = -Math.sin(sh.heading) * sd * sh.beam * 0.4;
+      this.particles.emit({ x: bx + sx, y: 0.3, z: bz + sz, vx: sx * 0.3, vz: sz * 0.3, life: 1.1, size: L * 0.14, grow: L * 0.2, color: 0xe6f6ff, alpha: 0.38 });
     }
   }
 
-  damagePlayer(dmg) {
+  collideIslands(sh) {
+    for (const isl of this.islands) {
+      const r = ISLAND_R + sh.beam * 0.5;
+      const dx = sh.x - isl.x, dz = sh.z - isl.z, d = Math.hypot(dx, dz);
+      if (d < r) {
+        // 점령한 섬에 닿으면 자동 정박
+        if (sh === this.player && this.state.done[isl.def.i] && !this.arena && this.canPark !== isl.def.i) { this.park(isl.def.i); return; }
+        const nx = dx / (d || 1), nz = dz / (d || 1);
+        sh.x = isl.x + nx * r; sh.z = isl.z + nz * r;
+        const vn = sh.vx * nx + sh.vz * nz;
+        if (vn < 0) { sh.vx -= vn * nx * 1.3; sh.vz -= vn * nz * 1.3; }
+      }
+    }
+    if (sh === this.player && this.canPark != null) {
+      const isl = this.islands.find(i => i.def.i === this.canPark);
+      if (!isl || Math.hypot(sh.x - isl.x, sh.z - isl.z) > ISLAND_R + 40) this.canPark = null;
+    }
+  }
+
+  // 포탑 하나: 측면 시야 50도 안의 적을 좌우 40도까지 조준, 2.8초마다 한 발
+  updateTurret(p, tu, dt) {
+    const pos = p.toWorld(tu.lx, tu.lz);
+    const face = p.heading + tu.side * Math.PI / 2;
+    let target = null, best = Infinity;
+    for (const e of this.near) {
+      const a = Math.atan2(e.x - pos.x, e.z - pos.z);
+      if (Math.abs(wrap(a - face)) < 50 * DEG) {
+        const d = Math.hypot(e.x - pos.x, e.z - pos.z);
+        if (d < best) { best = d; target = e; }
+      }
+    }
+    if (!target) { tu.t = 0.5; return; }
+    tu.t -= dt;
+    if (tu.t > 0) return;
+    tu.t = 2.8;
+    const yaw = face + clamp(wrap(Math.atan2(target.x - pos.x, target.z - pos.z) - face), -40 * DEG, 40 * DEG);
+    setTimeout(() => {
+      if (p.dead || this.parked != null) return;
+      const pp = p.toWorld(tu.lx, tu.lz);
+      this.fire(pp.x, 1.6 * K, pp.z, yaw, 10 * DEG, 24 * K, D.atk(this.state.lv.cannon), 'player');
+    }, 100);
+  }
+
+  fire(x, y, z, yaw, pitch, speed, atk, team) {
+    const mesh = new THREE.Mesh(this.bulletGeo, this.bulletMat);
+    mesh.position.set(x, y, z);
+    this.scene.add(mesh);
+    const h = Math.cos(pitch) * speed;
+    this.bullets.push({ mesh, x, y, z, vx: Math.sin(yaw) * h, vy: Math.sin(pitch) * speed, vz: Math.cos(yaw) * h, atk, team, t: 0 });
+    for (let k = 0; k < 3; k++) this.particles.emit({ x, y, z, vx: Math.sin(yaw) * rand(5, 15), vy: rand(2, 6), vz: Math.cos(yaw) * rand(5, 15), life: 0.9, size: 3, grow: 6, color: 0xd8d8d8, alpha: 0.7, drag: 2 });
+    this.particles.emit({ x, y, z, life: 0.12, size: 4, color: 0xffc040 });
+    const far = Math.hypot(x - this.player.x, z - this.player.z);
+    if (far < 400) this.sound.play('cannon', (team === 'enemy' ? 0.25 : 0.4) * (1 - far / 450), clamp((x - this.player.x) / 200, -1, 1));
+  }
+
+  updateBullets(dt) {
+    for (let i = this.bullets.length - 1; i >= 0; i--) {
+      const b = this.bullets[i];
+      b.t += dt;
+      b.vy -= D.G * dt;
+      b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
+      b.mesh.position.set(b.x, b.y, b.z);
+      let hit = false;
+      if (b.y < 5 * K) {
+        if (b.team === 'enemy') {
+          const p = this.player;
+          if (!p.dead && this.parked == null && p.contains(b.x, b.z, 0.4 * K)) { this.hitPlayer(b.atk); hit = true; }
+        } else {
+          for (const e of this.enemies) {
+            if (e.dead) continue;
+            if (Math.abs(e.x - b.x) < e.len && Math.abs(e.z - b.z) < e.len && e.contains(b.x, b.z, 0.4 * K)) { this.hitEnemy(e, b.atk); hit = true; break; }
+          }
+        }
+      }
+      if (hit) {
+        this.boom(b.x, b.y, b.z, 0xffa030);
+        this.scene.remove(b.mesh); this.bullets.splice(i, 1);
+        continue;
+      }
+      if (b.y <= 0 && b.t > 0.3) {
+        for (let k = 0; k < 6; k++) this.particles.emit({ x: b.x, y: 0.5, z: b.z, vx: rand(-6, 6), vy: rand(12, 28), vz: rand(-6, 6), grav: 60, life: 0.8, size: 1.8, color: 0xffffff, alpha: 0.9 });
+        this.particles.emit({ x: b.x, y: 0.3, z: b.z, life: 0.8, size: 3, grow: 12, color: 0xe6f6ff, alpha: 0.7 });
+        this.scene.remove(b.mesh); this.bullets.splice(i, 1);
+      }
+    }
+  }
+
+  boom(x, y, z, color) {
+    for (let k = 0; k < 10; k++) this.particles.emit({ x, y, z, vx: rand(-15, 15), vy: rand(6, 24), vz: rand(-15, 15), grav: 40, life: 0.6, size: 1.8, color: k % 2 ? color : 0x5a3a20 });
+    for (let k = 0; k < 3; k++) this.particles.emit({ x, y: y + 4, z, vy: 4, life: 1.2, size: 5, grow: 8, color: 0x555555, alpha: 0.6 });
+    const far = Math.hypot(x - this.player.x, z - this.player.z);
+    if (far < 300) this.sound.play('hit', 0.3 * (1 - far / 320));
+  }
+
+  hitPlayer(dmg) {
     const p = this.player;
-    if (p.sinking || this.docked) return;
+    if (p.dead || this.parked != null) return;
     p.hp -= dmg;
-    p.lastCombat = this.t;
-    this.ui.floatText(p.x, 8, p.z, '-' + D.fmt(dmg), '#ff6b6b');
+    this.ui.floatText(p.x, 30, p.z, '-' + dmg, '#ff6b6b');
     this.ui.hurt();
-    if (p.hp <= 0) this.playerSunk();
+    if (p.hp <= 0) { p.hp = 0; this.playerDead(); }
   }
 
-  playerSunk() {
-    const p = this.player;
-    p.hp = 0;
-    p.sinking = true; p.sinkT = 0;
-    this.cruise = false;
-    this.fishing = null;
+  playerDead() {
+    const p = this.player, s = this.state;
+    p.dead = true;
+    p.v = p.v2 = 0; p.s = 0; p.vx = p.vz = 0;
+    s.deaths++;
+    this.auto = false;
     this.sound.play('sink', 0.6);
-    for (let k = 0; k < 30; k++) this.particles.emit({ x: p.x + rand(-5, 5), y: 3, z: p.z + rand(-5, 5), vx: rand(-6, 6), vy: rand(4, 14), vz: rand(-6, 6), grav: 14, life: 1.2, size: 3, color: k % 2 ? 0xff8030 : 0x333333 });
-    if (this.arena) {
-      setTimeout(() => this.endArena(true), 1500);
-      return;
-    }
-    this.state.stats.deaths++;
-    const lost = { ...this.state.cargo };
-    for (const k of D.GOOD_IDS) this.state.cargo[k] = 0;
+    for (let k = 0; k < 30; k++) this.particles.emit({ x: p.x + rand(-10, 10), y: 6, z: p.z + rand(-10, 10), vx: rand(-15, 15), vy: rand(10, 30), vz: rand(-15, 15), grav: 30, life: 1.2, size: 3, color: k % 2 ? 0xff8030 : 0x333333 });
     this.save();
-    setTimeout(() => this.ui.showDeath(lost, () => this.respawn()), 1400);
+    if (this.arena) { setTimeout(() => this.endArena(), 1200); return; }
+    setTimeout(() => this.ui.showDeath(), 1200);
   }
 
-  respawn() {
-    const p = this.player;
-    p.sinking = false;
+  // 부활: 'island'(마지막 섬, 체력 100%) · 'ticket'(그 자리) · 'coin'(그 자리, 5000×선체)
+  revive(how) {
+    const p = this.player, s = this.state;
+    if (how === 'ticket') { if (s.revival <= 0) return false; s.revival--; }
+    if (how === 'coin') { const c = 5000 * s.lv.body; if (s.res[0] < c) return false; s.res[0] -= c; }
+    p.dead = false;
     p.obj.position.y = 0;
-    p.model.rotation.set(0, 0, 0);
-    p.refl.visible = true;
-    p.hp = this.stats.maxHp;
-    // 교전 중이던 섬 방어 함대와 주변 해적 정리
-    for (const isl of this.islands) this.disengage(isl);
-    for (const e of this.enemies) this.world.remove(e.obj);
-    this.enemies = [];
-    for (const b of this.balls) this.scene.remove(b.mesh);
-    this.balls = [];
-    const isl = this.islands.find(i => i.def.id === this.state.lastIsland) || this.islands.find(i => i.def.home);
-    this.placeAtDock(isl);
-    this.camTarget.set(p.x, 0, p.z);
+    p.hp = this.maxHp();
+    p.vx = p.vz = 0; p.omega = 0;
+    if (how === 'island') this.park(s.last);
     this.save();
     this.ui.updateHud(true);
+    return true;
   }
 
   // ---------- 적 ----------
-  spawnEnemy(typeId, tier, x, z, opts = {}) {
-    const T = D.ENEMY_TYPES[typeId];
-    const st = D.enemyStats(typeId, tier);
-    const obj = new THREE.Group();
-    let model;
-    if (T.boss) {
-      model = M.makeKraken();
-    } else {
-      model = M.makeShip({ len: 14 * T.scale, masts: T.masts, sail: T.sail, emblem: T.sail === 0x1d1d22 ? 'skull' : 'none', hull: T.hull, trim: T.trim, band: T.dragon ? 0x2a2140 : null, guns: T.guns, dragon: T.dragon, flag: 0x1d1d22 });
-    }
-    obj.add(model);
-    const refl = M.makeReflection(model);
-    obj.add(refl);
-    obj.position.set(x, 0, z);
-    this.world.add(obj);
-    const e = {
-      typeId, T, tier, obj, model, refl, x, z, heading: opts.heading ?? rand(0, TAU), speed: 0,
-      hp: st.hp, maxHp: st.hp, dmg: st.dmg, loot: st.loot,
-      cd: { '-1': rand(0.5, 2), '1': rand(0.5, 2) }, radius: model.userData.radius,
-      anchor: opts.anchor || { x, z }, leash: opts.leash || 300, island: opts.island || null, roam: !!opts.roam, arena: !!opts.arena,
-      aggro: !!opts.aggro, wander: { x, z, t: 0 }, orbit: Math.random() < 0.5 ? 1 : -1, id: Math.random().toString(36).slice(2),
-      scaleBall: T.scale > 1.4 ? 1.4 : 1,
-    };
+  spawnEnemy(lv, { x, z, pirate = false, home = null, arena = false }) {
+    const s = this.state;
+    const st = D.enemyStats(lv, pirate, s.world);
+    const e = new Ship(this, { x, z, heading: rand(0, TAU) });
+    const [len, beam] = D.HULL[lv - 1];
+    e.setSpec({ mass: st.mass, motor: st.motor, steer: st.steer, drag: 3, angDrag: 4, len: len * K, beam: beam * K });
+    let emblem;
+    if (pirate) emblem = lv >= 10 ? 5 : [0, 1, 2, 3, 4].filter(n => n !== s.emblem)[Math.floor(Math.random() * 4)];
+    else emblem = home.def.fac;
+    const look = M.boatLook({ body: lv, sail: st.lvSail, steer: st.lvHead, emblem, hulls: D.HULL, K });
+    e.setModel(M.makeShip({ ...look, guns: D.TURRETS[lv - 1] / 2 }));
+    e.obj.scale.setScalar(0.01);
+    Object.assign(e, { lv, hp: st.hp, maxHp: st.hp, atk: st.atk, pirate, home, arena, lock: false, back: false, pirateT: 10, addAngle: 1, angleT: 0, cd: { '-1': rand(0, 3), 1: rand(0, 3) }, id: Math.random().toString(36).slice(2), born: this.t });
     this.enemies.push(e);
     return e;
+  }
+
+  removeEnemy(e) {
+    const i = this.enemies.indexOf(e);
+    if (i >= 0) this.enemies.splice(i, 1);
+    e.dispose();
+    if (e.home) e.home.defenders = e.home.defenders.filter(x => x !== e);
   }
 
   updateEnemies(dt) {
     const p = this.player;
     for (let i = this.enemies.length - 1; i >= 0; i--) {
       const e = this.enemies[i];
+      e.obj.scale.setScalar(Math.min(1, (this.t - e.born) * 2.2 + 0.01));
       if (e.dead) {
         e.sinkT += dt;
-        e.obj.position.y = -e.sinkT * 3.5;
-        e.model.rotation.z = Math.min(1.1, e.sinkT * 0.7) * e.orbit;
-        e.refl.visible = false;
-        if (e.sinkT > 2.4) { this.world.remove(e.obj); this.enemies.splice(i, 1); }
+        e.obj.position.y = -e.sinkT * 6;
+        if (e.sinkT > 3) this.removeEnemy(e);
         continue;
       }
-      if (e.T.boss) { this.updateKraken(e, dt); continue; }
-      const dx = p.x - e.x, dz = p.z - e.z;
-      const d = Math.hypot(dx, dz);
-      if (!p.sinking && !this.docked) {
-        if (d < 140 || (e.island && e.island.engaged) || e.arena) e.aggro = true;
-      }
-      if (p.sinking || this.docked) e.aggro = false;
-      if (e.roam && d > 460) e.aggro = false;
-      const ax = e.x - e.anchor.x, az = e.z - e.anchor.z;
-      const leashed = Math.hypot(ax, az) > e.leash;
-      let desired = e.heading, spd = 0;
-      if (e.aggro && !leashed) {
-        const toP = Math.atan2(dx, dz);
-        const R = e.T.range;
-        if (d > R * 0.85) { desired = toP; spd = e.T.speed; }
-        else {
-          // 옆구리를 보이며 선회
-          desired = toP + e.orbit * Math.PI / 2 * (d < R * 0.45 ? 1.4 : 1);
-          spd = e.T.speed * 0.75;
+      const d = Math.hypot(e.x - p.x, e.z - p.z);
+      e.lock = p.dead ? false : e.pirate ? (this.arena ? true : d < 110 * K) : d < 60 * K;
+      if (e.lock) {
+        if (!e.pirate) {
+          if (Math.hypot(e.x - e.home.x, e.z - e.home.spawnZ) > 60 * K) this.backHome(e);
+          else if (!e.back) this.moveToAtk(e, d, dt);
+          else this.backHome(e);
+        } else {
+          this.moveToAtk(e, d, dt);
+          if (d > 60 * K && !this.arena) {
+            e.pirateT -= dt;
+            if (e.pirateT < 0) { this.removeEnemy(e); continue; }
+            e.v = 0; e.s = 0;
+          }
         }
-      } else if (leashed) {
-        desired = Math.atan2(e.anchor.x - e.x, e.anchor.z - e.z); spd = e.T.speed * 0.8;
+      } else if (!e.pirate) {
+        if (Math.hypot(e.x - e.home.x, e.z - e.home.spawnZ) > 30 * K) this.backHome(e);
+        else { e.v = 0; e.s = 0; }
       } else {
-        e.wander.t -= dt;
-        if (e.wander.t <= 0) {
-          e.wander.t = rand(4, 9);
-          const a = rand(0, TAU), r = rand(20, Math.min(120, e.leash * 0.5));
-          e.wander.x = e.anchor.x + Math.cos(a) * r; e.wander.z = e.anchor.z + Math.sin(a) * r;
-        }
-        desired = Math.atan2(e.wander.x - e.x, e.wander.z - e.z);
-        spd = dist2(e.x, e.z, e.wander.x, e.wander.z) > 100 ? e.T.speed * 0.4 : 0;
+        e.pirateT -= dt;
+        if (e.pirateT < 0) { this.removeEnemy(e); continue; }
+        e.v = 0; e.s = 0;
       }
-      const diff = wrap(desired - e.heading);
-      e.heading = wrap(e.heading + clamp(diff, -0.9 * dt, 0.9 * dt));
-      e.speed += (spd - e.speed) * Math.min(1, dt * 0.8);
-      e.x += Math.sin(e.heading) * e.speed * dt;
-      e.z += Math.cos(e.heading) * e.speed * dt;
+      e.physics(dt, 0.5);
       this.collideIslands(e);
-      // 적끼리 겹치지 않게
-      for (const o of this.enemies) {
-        if (o === e || o.dead) continue;
-        const rr = (o.radius + e.radius) * 0.8;
-        const q = dist2(o.x, o.z, e.x, e.z);
-        if (q < rr * rr && q > 0.01) {
-          const dd = Math.sqrt(q);
-          e.x += (e.x - o.x) / dd * (rr - dd) * 0.5; e.z += (e.z - o.z) / dd * (rr - dd) * 0.5;
-        }
-      }
       if (this.arena) {
-        const qx = e.x - ARENA_CENTER.x, qz = e.z - ARENA_CENTER.z, qd = Math.hypot(qx, qz);
-        if (qd > ARENA_R - 6) { e.x = ARENA_CENTER.x + qx / qd * (ARENA_R - 6); e.z = ARENA_CENTER.z + qz / qd * (ARENA_R - 6); }
+        const A = this.arenaPos, dx = e.x - A.x, dz = e.z - A.z, r = Math.hypot(dx, dz);
+        if (r > 205) { e.x = A.x + dx / r * 205; e.z = A.z + dz / r * 205; }
       }
-      e.obj.position.set(e.x, Math.sin(this.t * 1.5 + e.x) * 0.15, e.z);
-      e.obj.rotation.y = e.heading;
-      e.model.rotation.z = clamp(-diff * 0.1, -0.1, 0.1);
-      e.refl.rotation.copy(e.model.rotation);
-      // 포격
-      if (e.aggro && !p.sinking && !this.docked) {
-        for (const side of [-1, 1]) {
-          e.cd[side] -= dt;
-          if (e.cd[side] > 0) continue;
-          if (d > e.T.range + p.radius) continue;
-          const rel = wrap(Math.atan2(dx, dz) - e.heading);
-          if (Math.abs(wrap(rel - side * Math.PI / 2)) > 0.75) continue;
-          e.cd[side] = e.T.reload * rand(0.9, 1.25);
-          this.fireBroadside(e, side, p, e.dmg, 'enemy');
+      // 측면 사격: 그쪽 상자에 내가 있으면 3초마다 일제 사격
+      if (!p.dead && this.parked == null) {
+        const side = e.inAtkBox(p.x, p.z, e.lv);
+        for (const sd of [-1, 1]) {
+          e.cd[sd] -= dt;
+          if (side === sd && e.cd[sd] <= 0) { e.cd[sd] = 3; this.broadside(e, sd, e.atk, 'enemy', 20 * K, 20 * DEG); }
         }
       }
-      // 큰 피해를 입으면 불이 난다
       if (e.hp < e.maxHp * 0.4 && Math.random() < dt * 8) {
-        this.particles.emit({ x: e.x + rand(-2, 2), y: 4, z: e.z + rand(-2, 2), vy: rand(4, 8), life: 0.7, size: 2.5, grow: 2, color: Math.random() < 0.5 ? 0xff7a20 : 0xffc040 });
-        this.particles.emit({ x: e.x, y: 6, z: e.z, vy: 5, life: 1.6, size: 3, grow: 5, color: 0x3a3a3a, alpha: 0.5 });
+        this.particles.emit({ x: e.x + rand(-4, 4), y: 6, z: e.z + rand(-4, 4), vy: rand(6, 14), life: 0.7, size: 2.5, grow: 2, color: Math.random() < 0.5 ? 0xff7a20 : 0xffc040 });
+        this.particles.emit({ x: e.x, y: 10, z: e.z, vy: 8, life: 1.6, size: 4, grow: 6, color: 0x3a3a3a, alpha: 0.5 });
       }
-      // 배회하던 해적이 멀어지면 정리
-      if (e.roam && d > 760) { this.world.remove(e.obj); this.enemies.splice(i, 1); }
+      e.wakeT = (e.wakeT || 0) - dt;
+      if (e.speed() > 3 && e.wakeT <= 0) { e.wakeT = 0.1; this.wake(e); }
     }
   }
 
-  updateKraken(e, dt) {
+  broadside(sh, side, atk, team, speed, pitch) {
+    const yaw = sh.heading + side * Math.PI / 2;
+    for (const sl of sh.model.userData.slots) {
+      if (sl.side !== side) continue;
+      const w = sh.toWorld(sl.x, sl.z);
+      this.fire(w.x, 1.6 * K, w.z, yaw, pitch, speed, atk, team);
+    }
+  }
+
+  // 원작: 공격 거리 15 밖이면 접근, 안이면 내 배 방향에서 ±135도로 틀어 선회 (5초마다 무작위)
+  moveToAtk(e, d, dt) {
+    e.pirateT = 5;
     const p = this.player;
-    const d = Math.hypot(p.x - e.x, p.z - e.z);
-    e.attackAnim = Math.max(0, (e.attackAnim || 0) - dt);
-    M.animateKraken(e.model, this.t, e.attackAnim);
-    e.obj.rotation.y = Math.atan2(p.x - e.x, p.z - e.z);
-    e.refl.visible = false;
-    if (p.sinking || this.docked || !e.island?.engaged) return;
-    e.slamCd = (e.slamCd ?? 2) - dt;
-    e.inkCd = (e.inkCd ?? 3) - dt;
-    if (d < 110 && e.slamCd <= 0) {
-      e.slamCd = 3.4;
-      e.attackAnim = 1;
-      this.addWarning(p.x, p.z, 16, 1.15, () => {
-        if (dist2(p.x, p.z, this._wx, this._wz) < (16 + p.radius * 0.5) ** 2) this.damagePlayer(e.dmg * 1.6);
-        for (let k = 0; k < 20; k++) this.particles.emit({ x: this._wx + rand(-8, 8), y: 1, z: this._wz + rand(-8, 8), vy: rand(8, 16), grav: 22, life: 1, size: 2.4, color: 0xffffff });
-        this.sound.play('splash', 0.6);
-      });
-    }
-    if (d < 170 && e.inkCd <= 0) {
-      e.inkCd = 2.2;
-      this.spawnBall(e.x, e.z, p, e.dmg * 0.7, 'enemy', 1, true);
-    }
+    const bearing = Math.atan2(p.x - e.x, p.z - e.z);
+    e.angleT -= dt;
+    if (e.angleT <= 0) { e.angleT = 5; e.addAngle = Math.random() > 0.5 ? 1 : -1; }
+    e.v = e.motor;
+    e.steerTo(d > 15 * K ? bearing : bearing + e.addAngle * 135 * DEG, 0.01);
+  }
+  backHome(e) {
+    const hx = e.home.x, hz = e.home.spawnZ;
+    e.back = Math.hypot(e.x - hx, e.z - hz) >= 10 * K;
+    e.steerTo(Math.atan2(hx - e.x, hz - e.z), 0.03);
+    e.v = e.motor * 2;
   }
 
-  addWarning(x, z, r, delay, fn) {
-    const mesh = new THREE.Mesh(new THREE.RingGeometry(r * 0.85, r, 32), new THREE.MeshBasicMaterial({ color: 0xff3030, transparent: true, opacity: 0.7, depthWrite: false, side: THREE.DoubleSide }));
-    mesh.rotation.x = -Math.PI / 2;
-    mesh.position.set(x, 0.4, z);
-    mesh.renderOrder = 4;
-    this.scene.add(mesh);
-    const inner = new THREE.Mesh(new THREE.CircleGeometry(r, 32), new THREE.MeshBasicMaterial({ color: 0xff3030, transparent: true, opacity: 0.2, depthWrite: false }));
-    inner.rotation.x = -Math.PI / 2;
-    inner.position.set(x, 0.35, z);
-    this.scene.add(inner);
-    this.warnings.push({ mesh, inner, x, z, t: 0, delay, fn });
-  }
-  updateWarnings(dt) {
-    for (let i = this.warnings.length - 1; i >= 0; i--) {
-      const w = this.warnings[i];
-      w.t += dt;
-      w.inner.scale.setScalar(Math.min(1, w.t / w.delay));
-      if (w.t >= w.delay) {
-        this.scene.remove(w.mesh); this.scene.remove(w.inner);
-        this.warnings.splice(i, 1);
-        this._wx = w.x; this._wz = w.z;
-        w.fn();
-      }
-    }
-  }
-
-  damageEnemy(e, dmg) {
+  hitEnemy(e, dmg) {
     if (e.dead) return;
     e.hp -= dmg;
-    e.aggro = true;
-    this.ui.floatText(e.x, 10, e.z, D.fmt(dmg), '#ffe066');
+    this.ui.floatText(e.x, 26, e.z, String(dmg), '#ffe066');
     if (e.hp <= 0) this.killEnemy(e);
   }
 
   killEnemy(e) {
     e.dead = true; e.sinkT = 0;
-    if (e.island && e.island.remaining) e.island.remaining = e.island.remaining.filter(r => r !== e.slot);
-    this.state.stats.kills++;
-    this.sound.play('explode', 0.5, this.soundPan(e.x));
-    for (let k = 0; k < 26; k++) this.particles.emit({ x: e.x + rand(-4, 4), y: 4, z: e.z + rand(-4, 4), vx: rand(-10, 10), vy: rand(4, 16), vz: rand(-10, 10), grav: 16, life: 1.1, size: 3, color: k % 3 ? 0xff8a30 : 0x2a2a2a });
-    for (let k = 0; k < 6; k++) this.particles.emit({ x: e.x + rand(-4, 4), y: 6, z: e.z + rand(-4, 4), vy: 4, life: 2.2, size: 6, grow: 8, color: 0x444444, alpha: 0.5 });
-    if (this.arena) {
-      this.arena.kills++;
-      this.arena.reward += Math.round(e.loot * 0.7);
-      return;
-    }
-    this.dropLoot(e);
+    this.state.kills++;
+    this.sound.play('explode', 0.5);
+    for (let k = 0; k < 26; k++) this.particles.emit({ x: e.x + rand(-8, 8), y: 8, z: e.z + rand(-8, 8), vx: rand(-20, 20), vy: rand(8, 30), vz: rand(-20, 20), grav: 30, life: 1.1, size: 3, color: k % 3 ? 0xff8a30 : 0x2a2a2a });
+    if (e.home) e.home.defenders = e.home.defenders.filter(x => x !== e);
+    if (this.arena) { this.arena.kills++; return; }
+    // 떠다니는 상자 2~4개, 상자마다 따로 굴림
+    const n = 2 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < n; i++) this.dropCrate(e.x + rand(-12, 12), e.z + rand(-12, 12), D.rollLoot(e.lv));
   }
 
-  dropLoot(e) {
-    const t = e.tier;
-    const goods = {};
-    const roll = (id, chance, n) => { if (Math.random() < chance) goods[id] = (goods[id] || 0) + n; };
-    roll('wood', 0.85, 1 + Math.floor(t / 2) + Math.floor(Math.random() * 3));
-    if (t >= 2) roll('ore', 0.55, 1 + Math.floor(t / 4));
-    if (t >= 4) roll('silver', 0.35, 1 + Math.floor((t - 4) / 4));
-    if (t >= 7) roll('gold', 0.25, 1 + Math.floor((t - 7) / 4));
-    if (t >= 10) roll('gem', 0.04, 1);
-    if (e.T.boss) { goods.gem = 3; goods.gold = 10; }
-    const coins = Math.round(e.loot * rand(0.8, 1.2));
-    const n = e.T.boss ? 6 : 1;
-    for (let i = 0; i < n; i++) {
-      const obj = M.makeLoot(i === 0 && Object.keys(goods).length ? 'crate' : 'coin');
-      const x = e.x + rand(-5, 5) + (n > 1 ? rand(-20, 20) : 0), z = e.z + rand(-5, 5) + (n > 1 ? rand(-20, 20) : 0);
-      obj.position.set(x, 0, z);
-      this.world.add(obj);
-      this.loot.push({ obj, x, z, coins: Math.round(coins / n), goods: i === 0 ? goods : {}, t: 0 });
-    }
+  dropCrate(x, z, res, gift = false) {
+    const obj = M.makeLoot(gift ? 'gift' : 'crate');
+    obj.position.set(x, 0, z);
+    obj.scale.setScalar(K * 0.35);
+    this.world.add(obj);
+    this.loot.push({ obj, x, z, res, t: 0, gift });
   }
 
   updateLoot(dt) {
     const p = this.player;
-    const mag = this.stats.magnet + p.radius;
     for (let i = this.loot.length - 1; i >= 0; i--) {
       const l = this.loot[i];
       l.t += dt;
-      l.obj.position.y = Math.sin(this.t * 2 + l.x) * 0.3;
+      l.obj.position.y = Math.sin(this.t * 2 + l.x) * 0.5;
       l.obj.rotation.y += dt;
-      const d = Math.hypot(p.x - l.x, p.z - l.z);
-      if (!p.sinking && d < mag) {
-        const k = Math.min(1, dt * 6);
-        l.x += (p.x - l.x) * k; l.z += (p.z - l.z) * k;
-        l.obj.position.x = l.x; l.obj.position.z = l.z;
-        if (d < p.radius + 2) {
-          this.collect(l);
-          this.world.remove(l.obj);
-          this.loot.splice(i, 1);
-          continue;
-        }
+      if (l.t > (l.gift ? 120 : 60) || Math.hypot(p.x - l.x, p.z - l.z) > 100 * K) { this.world.remove(l.obj); this.loot.splice(i, 1); continue; }
+      if (!p.dead && this.parked == null && p.contains(l.x, l.z, 2 * K)) {
+        this.collectLoot(l);
+        this.world.remove(l.obj); this.loot.splice(i, 1);
       }
-      if (l.t > 90) { this.world.remove(l.obj); this.loot.splice(i, 1); }
+    }
+    // 획득 표시는 하나씩
+    this.lootQueueT -= dt;
+    if (this.lootQueue.length && this.lootQueueT <= 0) {
+      this.lootQueueT = 0.35;
+      const [k, v] = this.lootQueue.shift();
+      this.ui.floatText(p.x, 34, p.z, `${D.RES[k].name} +${D.fmt(v)}`, k === 0 ? '#ffd84a' : '#bfe9ff');
     }
   }
-
-  cargoUsed() { return D.GOOD_IDS.reduce((s, k) => s + this.state.cargo[k], 0); }
-
-  addCargo(goods) {
-    const got = {};
-    let full = false;
-    for (const k of D.GOOD_IDS) {
-      if (!goods[k]) continue;
-      const free = this.stats.cargo - this.cargoUsed();
-      const n = Math.min(goods[k], free);
-      if (n < goods[k]) full = true;
-      if (n > 0) { this.state.cargo[k] += n; got[k] = n; }
+  collectLoot(l) {
+    if (l.gift) {
+      const c = 500 * this.state.lv.body;
+      this.addRes(0, c);
+      this.ui.toast(`🎁 선물 상자! +${D.fmt(c)} 코인`, 'good', 2000);
+      return;
     }
-    if (full) this.ui.toast('선창이 가득 찼습니다', 'warn', 1500);
-    return got;
-  }
-
-  collect(l) {
-    this.state.coins += l.coins;
-    const got = this.addCargo(l.goods);
+    this.giveRes(l.res);
     this.sound.play('coin', 0.4);
-    const parts = [`+${D.fmt(l.coins)}`];
-    this.ui.floatText(this.player.x, 12, this.player.z, parts.join(' '), '#ffd84a');
-    let off = 0;
-    for (const k in got) { off += 3; this.ui.floatText(this.player.x, 12 + off, this.player.z, `${D.GOODS.find(g => g.id === k).name} +${got[k]}`, '#bfe9ff'); }
+  }
+  giveRes(r) {
+    for (let k = 0; k < 7; k++) if (r[k] > 0) { this.state.res[k] += r[k]; this.lootQueue.push([k, r[k]]); }
     this.ui.updateHud(true);
   }
+  addRes(k, v) { this.state.res[k] += v; this.sound.play('coin', 0.4); this.ui.updateHud(true); }
 
   // ---------- 섬 ----------
   updateIslands(dt) {
-    if (this.arena) return;
-    const p = this.player;
-    let banner = null;
-    let nearDock = null;
+    const p = this.player, s = this.state;
+    let near = false, banner = null;
     for (const isl of this.islands) {
-      const id = isl.def.id;
-      const d = Math.hypot(p.x - isl.x, p.z - isl.z);
+      const id = isl.def.i;
+      const d = Math.hypot(isl.x - p.x, isl.z - p.z);
       if (isl.obj.userData.spin) isl.obj.userData.spin.rotation.z += dt * 0.8;
       const sm = isl.obj.userData.smoke;
-      if (sm && d < 600 && Math.random() < dt * 6) this.particles.emit({ x: isl.x + sm.x + rand(-3, 3), y: sm.y, z: isl.z + sm.z + rand(-3, 3), vx: rand(-1, 1), vy: rand(5, 8), vz: rand(-1, 1), life: 3.5, size: 6, grow: 10, color: 0x6a6a6a, alpha: 0.45 });
-      if (this.state.captured[id]) {
-        if (Math.hypot(p.x - isl.dock.x, p.z - isl.dock.z) < 32) nearDock = isl;
-        continue;
-      }
-      if (!isl.engaged && !p.sinking && d < isl.radius + 170) this.engage(isl);
-      if (isl.engaged) {
+      if (sm && d < 900 && Math.random() < dt * 5) this.particles.emit({ x: isl.x + sm.x + rand(-4, 4), y: sm.y, z: isl.z + sm.z + rand(-4, 4), vy: rand(6, 10), life: 3.5, size: 8, grow: 12, color: 0x6a6a6a, alpha: 0.45 });
+      if (s.done[id]) { isl.fog.material.opacity = 0; if (d < D.FISH_R + ISLAND_R) near = true; continue; }
+      isl.fog.material.opacity = lerp(isl.fog.material.opacity, d < D.FOG_R && !this.arena && this.parked == null && isl.gen ? 0.16 : 0, dt * 2);
+      if (this.parked != null || this.arena || p.dead) continue;
+      if (d < D.ENGAGE_R) {
+        near = true;
+        if (!isl.gen) this.genDefenders(isl);
+      } else if (d > D.RESET_R && isl.gen) this.regenIsland(isl);
+      if (isl.gen) {
         const alive = isl.defenders.filter(e => !e.dead).length;
-        if (d > isl.radius + 650) { this.disengage(isl); continue; }
         if (alive === 0) { this.capture(isl); continue; }
-        if (d < isl.radius + 500) banner = `⚔ ${isl.def.name} 방어 함대 ${alive} / ${isl.total}`;
+        if (d < D.RESET_R) banner = `⚔ ${isl.def.name} 방어 함대 ${alive} / ${isl.total}`;
       }
     }
+    this.nearIsland = near;
     this.ui.banner(banner);
-    this.nearDock = nearDock && !this.docked && !p.sinking ? nearDock : null;
   }
 
-  engage(isl) {
-    isl.engaged = true;
-    const t = isl.def.tier;
-    if (!isl.remaining) {
-      // 처음 교전할 때 함대 구성을 정한다. 격침한 배는 후퇴했다 돌아와도 되살아나지 않는다
-      const local = t % 8;
-      const count = Math.min(6, 2 + Math.floor(local / 2) + (t >= 8 ? 1 : 0));
-      const types = isl.def.final ? ['dragon', 'frigate', 'frigate'] : D.fleetForTier(t, count);
-      isl.remaining = types.map(type => ({ type, hp: null }));
-      if (isl.def.final) isl.remaining.push({ type: 'kraken', hp: null });
-      isl.total = isl.remaining.length;
-    }
+  genDefenders(isl) {
+    const s = this.state;
+    isl.gen = true;
     isl.defenders = [];
-    const ships = isl.remaining.filter(r => r.type !== 'kraken');
-    ships.forEach((r, i) => {
-      const a = (i / ships.length) * TAU + 0.3;
-      const rad = isl.radius + 45;
-      const e = this.spawnEnemy(r.type, t, isl.x + Math.cos(a) * rad, isl.z + Math.sin(a) * rad, { anchor: { x: isl.x, z: isl.z }, leash: isl.radius + 300, island: isl, aggro: true });
-      if (r.hp) e.hp = r.hp;
-      e.slot = r;
+    isl.spawnZ = isl.z + 20 * K; // 원작: 섬 남쪽 20 지점 둘레에서 나타남
+    const n = s.world === 0 ? D.DEFENDERS[isl.def.tier] : 10;
+    isl.total = n;
+    for (let i = 0; i < n; i++) {
+      let x, z;
+      do { x = rand(-15, 15) * K; z = rand(-15, 15) * K; } while (Math.hypot(x, z) < 15 * K);
+      const e = this.spawnEnemy(D.enemyLevelForTier(isl.def.tier, s.world), { x: isl.x + x, z: isl.spawnZ + z, home: isl });
       isl.defenders.push(e);
-    });
-    const kr = isl.remaining.find(r => r.type === 'kraken');
-    if (kr) {
-      const k = this.spawnEnemy('kraken', t, isl.x, isl.z + isl.radius + 55, { anchor: { x: isl.x, z: isl.z }, island: isl, aggro: true });
-      if (kr.hp) k.hp = kr.hp;
-      k.slot = kr;
-      isl.defenders.push(k);
-      this.ui.toast('독도를 지키는 크라켄이 나타났습니다!', 'danger', 3500);
-      this.sound.play('horn', 0.6);
-    } else {
-      this.ui.toast(`${isl.def.name}의 방어 함대가 출동했습니다!`, 'danger', 2500);
-      this.sound.play('horn', 0.4);
     }
+    this.ui.toast(`${isl.def.name}의 방어 함대가 나타났습니다!`, 'danger', 2200);
+    this.sound.play('horn', 0.4);
   }
-
-  disengage(isl) {
-    if (!isl.engaged) return;
-    isl.engaged = false;
-    for (const e of isl.defenders) {
-      if (e.slot && !e.dead) e.slot.hp = e.hp;
-      const i = this.enemies.indexOf(e);
-      if (i >= 0) { this.world.remove(e.obj); this.enemies.splice(i, 1); }
-    }
+  regenIsland(isl) {
+    for (const e of [...isl.defenders]) this.removeEnemy(e);
     isl.defenders = [];
+    isl.gen = false;
   }
 
   capture(isl) {
-    isl.engaged = false;
-    isl.defenders = [];
-    isl.remaining = null;
     const s = this.state;
-    s.captured[isl.def.id] = true;
-    M.setIslandOwned(isl.obj, true);
-    M.setIslandOwned(isl.refl, true);
-    const t = isl.def.tier;
-    const coins = Math.round(60 * Math.pow(1.2, D.expectedLevel(t)));
-    s.coins += coins;
-    const goods = { wood: 5 + t * 2 };
-    if (t >= 2) goods.ore = t;
-    if (t >= 4) goods.silver = t - 3;
-    if (t >= 7) goods.gold = t - 6;
-    if (t >= 10) goods.gem = t >= 14 ? 2 : 1;
-    this.addCargo(goods);
+    isl.gen = false;
+    s.done[isl.def.i] = true;
+    M.setIslandOwned(isl.obj, true, s.emblem, isl.def.fac);
+    M.setIslandOwned(isl.refl, true, s.emblem, isl.def.fac);
+    if (s.target === isl.def.i || s.done[s.target]) s.target = this.nextTarget();
     this.sound.play('fanfare', 0.6);
-    this.ui.toast(`🏝 ${isl.def.name} 점령! +${D.fmt(coins)} 코인`, 'good', 3500);
-    for (let k = 0; k < 40; k++) this.particles.emit({ x: isl.x + rand(-20, 20), y: 12, z: isl.z + rand(-20, 20), vx: rand(-10, 10), vy: rand(10, 25), vz: rand(-10, 10), grav: 14, life: 1.8, size: 2.2, color: [0xffd84a, 0xff6b6b, 0x6bd5ff, 0x8aff8a][k % 4] });
-    const ocean = D.OCEANS[s.ocean];
-    if (s.ocean === 0 && ocean.islands.every(i => s.captured[i.id]) && !s.unlocked[1]) {
-      s.unlocked[1] = true;
-      setTimeout(() => this.ui.toast('🌍 대서양 항로가 열렸습니다! 지도에서 이동하세요', 'good', 5000), 3000);
-    }
-    if (isl.def.final) {
-      s.dokdo = true;
-      setTimeout(() => this.ui.showEnding(), 2000);
-    }
     this.save();
-    this.ui.updateHud(true);
+    const reward = D.captureReward(isl.def.tier);
+    this.ui.showCapture(isl, reward, () => {
+      this.giveRes(reward);
+      this.save();
+      const all = w => D.ISLANDS.filter(i => i.world === w).every(i => s.done[i.i]);
+      if (s.world === 0 && all(0) && !s.italyNotice) { s.italyNotice = true; this.ui.showAllCaptured(false); }
+      else if (s.world === 1 && all(1)) this.ui.showAllCaptured(true);
+    });
   }
+  nextTarget() {
+    const s = this.state;
+    const list = D.ISLANDS.filter(i => i.world === s.world && !s.done[i.i]);
+    return list.length ? list[0].i : -1;
+  }
+  italyOpen() { return D.ISLANDS.filter(i => i.world === 0).every(i => this.state.done[i.i]); }
 
-  dock() {
-    const isl = this.nearDock;
+  park(id, silent = false) {
+    const s = this.state;
+    const isl = this.islands.find(i => i.def.i === id) || this.islands.find(i => s.done[i.def.i]);
     if (!isl) return;
-    this.docked = isl.def.id;
-    this.state.lastIsland = isl.def.id;
-    this.cruise = false;
-    this.fishing = null;
-    this.ui.openIsland(isl);
-    this.sound.play('bell', 0.4);
+    this.parked = isl.def.i;
+    s.last = isl.def.i;
+    this.tempFish = 0;
+    this.auto = false;
+    this.input.touch = false;
+    const p = this.player;
+    if (silent || Math.hypot(p.x - isl.dock.x, p.z - isl.dock.z) > 400) { p.x = isl.dock.x; p.z = isl.dock.z; p.heading = Math.PI * 0.75; if (this.camTarget) this.camTarget.set(p.x, 0, p.z); }
+    p.vx = p.vz = 0;
+    // 정박하면 모든 적이 사라지고 섬 함대도 초기화
+    for (const e of [...this.enemies]) this.removeEnemy(e);
+    for (const i of this.islands) { i.gen = false; i.defenders = []; }
+    for (const b of this.bullets) this.scene.remove(b.mesh);
+    this.bullets = [];
+    this.setupHelpers();
     this.save();
+    if (!silent) this.sound.play('bell', 0.4);
+    this.ui.openIsland(isl);
   }
-  undock() {
-    this.docked = null;
+  unpark() {
+    const isl = this.islands.find(i => i.def.i === this.parked);
+    this.canPark = this.parked;
+    this.parked = null;
     this.ui.closeIsland();
     const p = this.player;
-    p.heading = 0;
-    p.speed = 4;
+    if (isl) {
+      const a = Math.atan2(isl.dock.x - isl.x, isl.dock.z - isl.z);
+      p.heading = a; p.vx = Math.sin(a) * 20; p.vz = Math.cos(a) * 20;
+    }
+    this.pirateT = 10;
     this.save();
   }
 
-  // ---------- 배회 해적 ----------
-  zoneTier(x, z) {
-    const base = this.state.ocean === 0 ? 0 : 8;
-    const f = clamp((820 - z) / 1600, 0, 1);
-    return Math.max(base, Math.floor(base + f * 7.5 - 0.3));
+  // ---------- 해적, 독도, 선물 상자 ----------
+  updateSpawners(dt) {
+    const p = this.player, s = this.state;
+    if (this.parked != null || p.dead || this.arena) return;
+    const dist0 = Math.hypot(p.x, p.z);
+    this.pirateT -= dt;
+    if (this.pirateT <= 0) {
+      const pirates = this.enemies.filter(e => e.pirate && !e.dead).length;
+      this.pirateT = 5 + pirates * 5;
+      if (!this.nearIsland) {
+        const max = dist0 < 500 * K ? 2 : dist0 < 900 * K ? 3 : 4;
+        const n = 1 + Math.floor(Math.random() * (max - 1));
+        for (let i = 0; i < n; i++) this.genPirate();
+      }
+    }
+    // 독도: 150 안이면 10초마다 Lv10 해적이 몰려온다
+    if (s.world === 0 && Math.hypot(p.x - D.DOKDO.x, p.z - D.DOKDO.z) < 150 * K) {
+      if (!s.dokdoVisited) { s.dokdoVisited = true; this.save(); this.ui.showDokdo(); }
+      this.dokdoT -= dt;
+      if (this.dokdoT <= 0) {
+        this.dokdoT = 10;
+        const n = 1 + Math.floor(Math.random() * 7);
+        for (let i = 0; i < n; i++) {
+          if (this.enemies.filter(e => e.pirate && !e.dead).length >= 8) break;
+          let x, z;
+          do { x = rand(-50, 50) * K; z = rand(-50, 50) * K; } while (Math.hypot(x, z) < 50 * K);
+          this.spawnEnemy(10, { x: D.DOKDO.x + x, z: D.DOKDO.z + z, pirate: true });
+        }
+      }
+    }
+    // 5분마다 선물 상자
+    this.giftT -= dt;
+    if (this.giftT <= 0) {
+      this.giftT = 300;
+      const a = rand(0, TAU);
+      this.dropCrate(p.x + Math.cos(a) * 15 * K, p.z + Math.sin(a) * 15 * K, null, true);
+      this.ui.toast('🎁 근처에 선물 상자가 떠 있어요!', 'good', 2500);
+    }
+  }
+  genPirate() {
+    const p = this.player, s = this.state;
+    let n = D.pirateTier(Math.hypot(p.x, p.z), s.world);
+    if (this.enemies.filter(e => e.pirate && !e.dead).length >= n + 2) return;
+    const gx = p.x + Math.sin(p.heading) * 15 * K, gz = p.z + Math.cos(p.heading) * 15 * K;
+    let x, z;
+    do { x = rand(-20, 20) * K; z = rand(-20, 20) * K; } while (Math.hypot(x, z) < 20 * K);
+    if (Math.random() < 1 / 200) n = 6;
+    this.spawnEnemy(D.enemyLevelForTier(n, s.world), { x: gx + x, z: gz + z, pirate: true });
   }
 
-  updateSpawns(dt) {
-    if (this.arena || this.docked) return;
-    this.spawnTimer -= dt;
-    if (this.spawnTimer > 0) return;
-    this.spawnTimer = 4;
+  // ---------- 크라켄: 지나가면 촉수를 휘두르고 사라진다 ----------
+  updateKrakens(dt) {
     const p = this.player;
-    const roaming = this.enemies.filter(e => e.roam && !e.dead).length;
-    if (roaming >= 3) return;
-    for (let tries = 0; tries < 6; tries++) {
-      const a = rand(0, TAU), r = rand(260, 420);
-      const x = p.x + Math.cos(a) * r, z = p.z + Math.sin(a) * r;
-      if (Math.abs(x) > D.OCEAN_HALF - 40 || Math.abs(z) > D.OCEAN_HALF - 40) continue;
-      let ok = true;
-      for (const isl of this.islands) {
-        const safe = this.state.captured[isl.def.id] ? isl.radius + 230 : isl.radius + 90;
-        if (dist2(isl.x, isl.z, x, z) < safe * safe) { ok = false; break; }
+    for (const k of this.krakens) {
+      k.cool -= dt;
+      if (k.state === 'hidden') {
+        if (k.cool <= 0 && !p.dead && this.parked == null && Math.hypot(p.x - k.x, p.z - k.z) < 14 * K) {
+          k.state = 'attack'; k.t = 0;
+          k.obj.visible = true;
+          k.obj.rotation.y = Math.atan2(p.x - k.x, p.z - k.z);
+          this.sound.play('splash', 0.7);
+          this.shake = 0.4;
+          for (let i = 0; i < 30; i++) this.particles.emit({ x: k.x + rand(-20, 20), y: 1, z: k.z + rand(-20, 20), vy: rand(15, 35), grav: 50, life: 1, size: 3, color: 0xffffff });
+        }
+      } else {
+        k.t += dt;
+        k.obj.position.y = k.t < 0.6 ? -40 + k.t / 0.6 * 40 : k.t > 2.4 ? -(k.t - 2.4) / 0.6 * 40 : 0;
+        M.animateKraken(k.obj, this.t * 2, k.t > 0.6 && k.t < 1.6 ? 1 : 0);
+        if (k.t > 3) { k.state = 'hidden'; k.obj.visible = false; k.cool = 300; }
       }
-      if (dist2(this.gate.x, this.gate.z, x, z) < 120 * 120) ok = false;
-      if (!ok) continue;
-      const t = this.zoneTier(x, z);
-      const pool = D.fleetForTier(t, 2);
-      const n = Math.random() < 0.3 ? 2 : 1;
-      for (let i = 0; i < n; i++) this.spawnEnemy(pool[i % 2], t, x + i * 25, z + i * 10, { roam: true, leash: 260 });
-      return;
     }
   }
 
   // ---------- 조수 ----------
-  updateAssistants(dt) {
-    const p = this.player, a = this.state.assistants;
-    const A = this.assist;
-    if (A.escort) {
-      const E = A.escort;
-      const back = -18 - p.radius, side = -14;
-      const tx = p.x + Math.sin(p.heading) * back + Math.cos(p.heading) * side;
-      const tz = p.z + Math.cos(p.heading) * back - Math.sin(p.heading) * side;
-      const dx = tx - E.x, dz = tz - E.z, d = Math.hypot(dx, dz);
-      if (d > 300) { E.x = tx; E.z = tz; }
-      const spd = clamp(d * 0.8, 0, this.stats.speed * 1.3);
-      if (d > 2) { E.h += wrap(Math.atan2(dx, dz) - E.h) * Math.min(1, dt * 3); E.x += Math.sin(E.h) * spd * dt; E.z += Math.cos(E.h) * spd * dt; }
-      else E.h += wrap(p.heading - E.h) * Math.min(1, dt * 2);
-      E.obj.position.set(E.x, Math.sin(this.t * 1.7) * 0.15, E.z);
-      E.obj.rotation.y = E.h;
-      E.cd -= dt;
-      if (E.cd <= 0 && !this.docked && !p.sinking) {
-        let best = null, bd = 75 * 75;
-        for (const e of this.enemies) { if (e.dead) continue; const q = dist2(E.x, E.z, e.x, e.z); if (q < bd) { bd = q; best = e; } }
-        if (best) {
-          E.cd = 2.4;
-          this.spawnBall(E.x, E.z, best, this.stats.dmg * (0.25 + 0.1 * a.escort), 'escort');
-          this.particles.emit({ x: E.x, y: 2, z: E.z, life: 0.6, size: 3, grow: 5, color: 0xdddddd, alpha: 0.6 });
+  updateHelpers(dt) {
+    const p = this.player;
+    for (const h of this.helpers) {
+      if (h.kind === 'ship') {
+        const sh = h.ship;
+        if (this.parked != null) {
+          const isl = this.islands.find(i => i.def.i === this.parked);
+          if (isl) {
+            const a = Math.atan2(isl.dock.x - isl.x, isl.dock.z - isl.z) + (h.idx - 1) * 0.35;
+            sh.x = lerp(sh.x, isl.x + Math.sin(a) * (ISLAND_R + 55), dt); sh.z = lerp(sh.z, isl.z + Math.cos(a) * (ISLAND_R + 55), dt);
+            sh.heading = p.heading; sh.vx = sh.vz = 0;
+          }
+          continue;
+        }
+        if (p.dead) { sh.v = 0; sh.s = 0; sh.physics(dt, 0.5); continue; }
+        const d = Math.hypot(sh.x - p.x, sh.z - p.z);
+        // 원작: 15 밖이면 따라오고, 40 넘으면 두 배 속도, 100 넘으면 근처로 이동
+        if (d > 100 * K) { const a = rand(0, TAU); sh.x = p.x + Math.cos(a) * 30 * K; sh.z = p.z + Math.sin(a) * 30 * K; }
+        if (d > 15 * K) { sh.v = d > 40 * K ? sh.motor * 2 : sh.motor; sh.steerTo(Math.atan2(p.x - sh.x, p.z - sh.z), 0.01); }
+        else if (d > 5 * K) { sh.v = sh.motor * 0.3; sh.steerTo(p.heading, 0.003); }
+        else { sh.v = 0; sh.s = 0; }
+        sh.physics(dt, 0.5);
+        this.collideIslands(sh);
+        for (const sd of [-1, 1]) {
+          sh.cd[sd] -= dt;
+          if (sh.cd[sd] > 0) continue;
+          if (this.enemies.some(e => !e.dead && sh.inAtkBox(e.x, e.z, sh.body) === sd)) { sh.cd[sd] = 3; this.broadside(sh, sd, sh.atk, 'player', 20 * K, 20 * DEG); }
+        }
+      } else if (h.kind === 'gull') {
+        const ph = this.t * 1.2 + h.phase;
+        h.obj.position.set(p.x + Math.cos(ph) * 12 * K, 10 * K + Math.sin(ph * 2) * 4, p.z + Math.sin(ph) * 12 * K);
+        h.obj.rotation.y = -ph;
+        M.flap(h.obj, this.t + h.phase);
+      } else if (h.kind === 'nessy') {
+        const back = -p.len * 1.4, side = p.beam * 2;
+        const tx = p.x + Math.sin(p.heading) * back + Math.cos(p.heading) * side;
+        const tz = p.z + Math.cos(p.heading) * back - Math.sin(p.heading) * side;
+        h.x = lerp(h.x, tx, dt * 1.5); h.z = lerp(h.z, tz, dt * 1.5);
+        h.h = wrap(h.h + wrap(p.heading - h.h) * Math.min(1, dt * 2));
+        h.obj.position.set(h.x, Math.sin(this.t * 2) * 0.6 - 0.8, h.z);
+        h.obj.rotation.y = h.h;
+      } else if (h.kind === 'pickup') {
+        const sh = h.ship;
+        if (this.parked != null || p.dead) { sh.v = 0; sh.s = 0; sh.physics(dt, 1); continue; }
+        if (!h.target || !this.loot.includes(h.target)) h.target = this.loot.filter(l => !l.gift && Math.hypot(l.x - p.x, l.z - p.z) < 60 * K).sort((a, b) => Math.hypot(a.x - sh.x, a.z - sh.z) - Math.hypot(b.x - sh.x, b.z - sh.z))[0] || null;
+        const tx = h.target ? h.target.x : p.x - Math.sin(p.heading) * 10 * K, tz = h.target ? h.target.z : p.z - Math.cos(p.heading) * 10 * K;
+        const d = Math.hypot(tx - sh.x, tz - sh.z);
+        if (Math.hypot(sh.x - p.x, sh.z - p.z) > 100 * K) { sh.x = p.x; sh.z = p.z + 20; }
+        if (d > 3 * K) { sh.v = sh.motor; sh.steerTo(Math.atan2(tx - sh.x, tz - sh.z), 0.02); } else { sh.v = 0; sh.s = 0; }
+        sh.physics(dt, 1);
+        this.collideIslands(sh);
+        if (h.target && d < 4 * K) {
+          const l = h.target;
+          this.collectLoot(l);
+          this.world.remove(l.obj); this.loot.splice(this.loot.indexOf(l), 1);
+          h.target = null;
         }
       }
-    }
-    if (A.seagull) {
-      A.seagull.gs.forEach((g, i) => {
-        const ph = this.t * 1.2 + g.userData.phase;
-        g.position.set(p.x + Math.cos(ph) * 16, 24 + Math.sin(ph * 2) * 2, p.z + Math.sin(ph) * 16);
-        g.rotation.y = -ph;
-        M.flap(g, this.t + i);
-      });
-      if (this.t - p.lastCombat > 4 && !p.sinking) p.hp = Math.min(this.stats.maxHp, p.hp + this.stats.maxHp * 0.004 * a.seagull * dt);
-    }
-    if (A.nessy) {
-      const N = A.nessy;
-      const back = -22 - p.radius, side = 14;
-      const tx = p.x + Math.sin(p.heading) * back + Math.cos(p.heading) * side;
-      const tz = p.z + Math.cos(p.heading) * back - Math.sin(p.heading) * side;
-      N.x += (tx - N.x) * Math.min(1, dt * 1.5); N.z += (tz - N.z) * Math.min(1, dt * 1.5);
-      N.h += wrap(p.heading - N.h) * Math.min(1, dt * 2);
-      N.obj.position.set(N.x, Math.sin(this.t * 2) * 0.4 - 0.5, N.z);
-      N.obj.rotation.y = N.h;
-    }
-    if (A.dolphin) {
-      const Dd = A.dolphin;
-      Dd.t += dt;
-      const cyc = (Dd.t % 2.2) / 2.2;
-      const side = 12 + p.radius * 0.5;
-      const fwd = (cyc - 0.5) * 16;
-      const x = p.x + Math.sin(p.heading) * fwd + Math.cos(p.heading) * side;
-      const z = p.z + Math.cos(p.heading) * fwd - Math.sin(p.heading) * side;
-      const y = Math.sin(cyc * Math.PI) * 6 - 1.5;
-      Dd.obj.position.set(x, y, z);
-      Dd.obj.rotation.set(-Math.cos(cyc * Math.PI) * 0.8, p.heading, 0);
-      if (cyc < 0.04 || cyc > 0.96) this.particles.emit({ x, y: 0.5, z, vy: 6, grav: 20, life: 0.5, size: 2, color: 0xffffff });
-    }
-  }
-
-  // ---------- 낚시 ----------
-  canFish() {
-    const p = this.player;
-    if (this.docked || p.sinking || this.arena) return false;
-    const near = this.islands.some(i => this.state.captured[i.def.id] && dist2(i.x, i.z, p.x, p.z) < (i.radius + 140) ** 2);
-    if (!near) return false;
-    return !this.enemies.some(e => !e.dead && dist2(e.x, e.z, p.x, p.z) < 150 * 150);
-  }
-  toggleFishing() {
-    if (this.fishing) { this.fishing = null; return; }
-    if (!this.canFish()) return;
-    this.cruise = false;
-    this.fishing = { t: 0 };
-    this.sound.play('splash', 0.3);
-  }
-  updateFishing(dt) {
-    const f = this.fishing;
-    const p = this.player;
-    if (!f) return;
-    if (!this.canFish() || (this.input.active && this.input.moved) || this.input.keys.size) { this.fishing = null; return; }
-    f.t += dt;
-    if (Math.random() < dt * 3) {
-      const a = rand(0, TAU);
-      this.particles.emit({ x: p.x + Math.cos(a) * (p.radius + 6), y: 0.4, z: p.z + Math.sin(a) * (p.radius + 6), life: 1, size: 2, grow: 4, color: 0xffffff, alpha: 0.6 });
-    }
-    if (f.t >= this.stats.fishTime) {
-      f.t = 0;
-      const lv = this.state.lv.fish;
-      const catchN = Math.max(1, Math.round(this.stats.fishAmount * rand(0.7, 1.3)));
-      const goods = { fish: catchN };
-      if (Math.random() < 0.04 + lv * 0.004) goods.ore = 1;
-      if (lv >= 8 && Math.random() < 0.02 + lv * 0.002) goods.silver = 1;
-      if (lv >= 16 && Math.random() < 0.01 + lv * 0.001) goods.gold = 1;
-      if (lv >= 26 && Math.random() < 0.004) goods.gem = 1;
-      const got = this.addCargo(goods);
-      if (!Object.keys(got).length) { this.fishing = null; return; }
-      this.state.stats.fished += got.fish || 0;
-      this.sound.play('fish', 0.4);
-      let off = 0;
-      for (const k in got) { this.ui.floatText(p.x, 10 + off, p.z, `${D.GOODS.find(g => g.id === k).name} +${got[k]}`, k === 'fish' ? '#bfe9ff' : '#ffd84a'); off += 3; }
-      for (let k = 0; k < 8; k++) this.particles.emit({ x: p.x + rand(-6, 6), y: 0.5, z: p.z + rand(-6, 6), vy: rand(5, 10), grav: 20, life: 0.7, size: 1.6, color: 0xffffff });
-      this.ui.updateHud(true);
     }
   }
 
   // ---------- 아레나 ----------
   nearGate() {
-    if (this.arena || !this.gate) return false;
-    return dist2(this.player.x, this.player.z, this.gate.x, this.gate.z) < 30 * 30;
+    if (this.arena || this.parked != null || !this.gateObj || this.player.dead) return false;
+    const g = this.gateObj.position;
+    return Math.hypot(this.player.x - g.x, this.player.z - g.z) < 45;
   }
   enterArena() {
-    const p = this.player;
-    for (const isl of this.islands) this.disengage(isl);
-    for (const e of this.enemies) this.world.remove(e.obj);
-    this.enemies = [];
-    this.arena = { wave: 0, kills: 0, reward: 0, next: 2, from: { x: p.x, z: p.z } };
-    this.fishing = null; this.cruise = false;
-    p.x = ARENA_CENTER.x; p.z = ARENA_CENTER.z + ARENA_R * 0.6; p.heading = Math.PI; p.speed = 0;
-    p.hp = this.stats.maxHp;
+    const p = this.player, A = this.arenaPos;
+    for (const e of [...this.enemies]) this.removeEnemy(e);
+    for (const i of this.islands) { i.gen = false; i.defenders = []; }
+    this.arena = { kills: 0, lv: 0, t: 2 };
+    this.auto = false;
+    p.x = A.x; p.z = A.z + 120; p.vx = p.vz = 0; p.heading = Math.PI;
     this.camTarget.set(p.x, 0, p.z);
-    this.ui.toast('아레나 입장! 몰려오는 해적을 물리치세요', 'danger', 2500);
+    this.ui.toast('아레나 입장! 문이 닫혔습니다', 'danger', 2000);
     this.sound.play('horn', 0.5);
   }
   updateArena(dt) {
     const A = this.arena;
     if (!A) return;
-    const alive = this.enemies.filter(e => !e.dead).length;
-    if (alive === 0) {
-      A.next -= dt;
-      if (A.next <= 0) {
-        A.wave++;
-        A.next = 3;
-        const base = this.state.ocean === 0 ? 0 : 8;
-        const t = Math.floor(base + (A.wave - 1) * 0.6);
-        const n = Math.min(9, 2 + A.wave);
-        const types = D.fleetForTier(t, n);
-        types.forEach((ty, i) => {
-          const a = (i / n) * TAU + rand(0, 0.5);
-          this.spawnEnemy(ty, t, ARENA_CENTER.x + Math.cos(a) * (ARENA_R - 30), ARENA_CENTER.z + Math.sin(a) * (ARENA_R - 30), { arena: true, aggro: true, leash: 9999, anchor: { ...ARENA_CENTER } });
-        });
-        this.ui.toast(`웨이브 ${A.wave}`, 'danger', 1500);
-        this.sound.play('horn', 0.35);
+    const p = this.player;
+    const dx = p.x - this.arenaPos.x, dz = p.z - this.arenaPos.z, r = Math.hypot(dx, dz);
+    if (r > 205) { p.x = this.arenaPos.x + dx / r * 205; p.z = this.arenaPos.z + dz / r * 205; p.vx *= 0.3; p.vz *= 0.3; }
+    if (p.dead) return;
+    if (!this.enemies.some(e => !e.dead)) {
+      A.t -= dt;
+      if (A.t <= 0) {
+        // 7척씩, 웨이브마다 레벨 상승 (이탈리아는 처음부터 최고)
+        const idx = this.state.world === 1 ? 6 : Math.min(6, A.lv);
+        for (let i = 0; i < 7; i++) {
+          let x, z;
+          do { x = rand(-30, 30) * K; z = rand(-30, 30) * K; } while (Math.hypot(x, z) < 30 * K);
+          this.spawnEnemy(D.enemyLevelForTier(idx, this.state.world), { x: this.arenaPos.x + x * 0.8, z: this.arenaPos.z + z * 0.8, pirate: true, arena: true });
+        }
+        A.lv++;
+        A.t = 2;
+        this.sound.play('fanfare', 0.3);
       }
     }
-    this.ui.arenaHud({ wave: A.wave, kills: A.kills, reward: A.reward, alive, best: this.state.arenaBest[this.state.ocean] });
+    this.ui.arenaHud(A.kills);
   }
-  endArena(died) {
+  endArena() {
     const A = this.arena;
     if (!A) return;
-    const p = this.player;
-    const oc = this.state.ocean;
-    const cleared = Math.max(0, died ? A.wave - 1 : (this.enemies.some(e => !e.dead) ? A.wave - 1 : A.wave));
-    const newBest = cleared > this.state.arenaBest[oc];
-    if (newBest) this.state.arenaBest[oc] = cleared;
-    this.state.coins += A.reward;
-    for (const e of this.enemies) this.world.remove(e.obj);
-    this.enemies = [];
-    for (const b of this.balls) this.scene.remove(b.mesh);
-    this.balls = [];
+    const s = this.state, p = this.player;
+    const reward = D.arenaReward(A.kills);
+    const prev = s.best[s.world];
+    if (A.kills > prev) s.best[s.world] = A.kills;
+    for (const e of [...this.enemies]) this.removeEnemy(e);
+    for (const b of this.bullets) this.scene.remove(b.mesh);
+    this.bullets = [];
     this.arena = null;
-    p.sinking = false; p.obj.position.y = 0; p.model.rotation.set(0, 0, 0); p.refl.visible = true;
-    p.hp = this.stats.maxHp;
-    p.x = this.gate.x; p.z = this.gate.z + 45; p.heading = 0; p.speed = 0;
-    this.camTarget.set(p.x, 0, p.z);
     this.ui.arenaHud(null);
-    this.ui.alert('아레나 결과', `클리어한 웨이브: ${cleared}${newBest ? ' (최고 기록!)' : ''}<br>격침: ${A.kills}척<br>보상: ${D.fmt(A.reward)} 코인`);
-    this.save();
-    this.ui.updateHud(true);
+    this.ui.showArenaResult(A.kills, Math.max(prev, A.kills), reward, () => {
+      if (reward > 0) this.addRes(0, reward);
+      if (p.dead) { p.dead = false; p.hp = this.maxHp(); }
+      p.obj.position.y = 0;
+      const g = this.gateObj.position;
+      p.x = g.x; p.z = g.z + 70; p.vx = p.vz = 0; p.heading = 0;
+      this.camTarget.set(p.x, 0, p.z);
+      this.save();
+    });
   }
 
-  travel(oceanId) {
-    if (!this.state.unlocked[oceanId] || oceanId === this.state.ocean) return;
-    this.state.ocean = oceanId;
-    const home = D.OCEANS[oceanId].islands.find(i => i.home);
-    this.state.lastIsland = home.id;
-    this.state.pos = null;
-    this.docked = null;
-    this.fishing = null;
-    this.buildOcean(oceanId);
-    this.player.hp = this.stats.maxHp;
+  // ---------- 바다 이동 ----------
+  changeWorld() {
+    const s = this.state;
+    s.lastByWorld[s.world] = s.last;
+    s.world = s.world === 0 ? 1 : 0;
+    s.last = s.lastByWorld[s.world];
+    s.done[s.world === 0 ? 0 : 28] = true;
+    if (s.target < 0 || D.ISLANDS[s.target]?.world !== s.world || s.done[s.target]) s.target = this.nextTarget();
+    this.parked = null;
+    this.buildWorld();
     this.save();
-    this.ui.toast(`${D.OCEANS[oceanId].name}에 도착했습니다`, 'good', 2500);
   }
 
   // ---------- 카메라, 주변 ----------
   updateCamera(dt) {
     const p = this.player;
     if (!p) return;
-    this.zoom += (this.zoomTarget - this.zoom) * Math.min(1, dt * 4);
+    this.camSize = lerp(this.camSize, this.camSizeTarget, dt * 4);
+    const half = this.camSize * K;
     const target = new THREE.Vector3(p.x, 0, p.z);
-    // 정박 중에는 배가 메뉴 위로 보이도록 시점을 내린다
-    if (this.docked) {
-      if (this.vw > this.vh && this.vh <= 640) target.x += 70 * this.zoom;
-      else target.z += 95 * this.zoom;
+    if (this.parked != null) {
+      // 정박 중에는 배가 메뉴에 가리지 않게
+      if (this.vw > this.vh && this.vh <= 640) target.x += half * (this.vw / this.vh) * 0.45;
+      else target.z += half * 0.9;
     }
     if (!this.camTarget) this.camTarget = target.clone();
-    this.camTarget.lerp(target, Math.min(1, dt * 4));
-    const s = (0.8 + p.model.userData.len / 30) * this.zoom;
-    const portrait = this.vw < this.vh;
-    const off = portrait ? new THREE.Vector3(0, 128, 80) : new THREE.Vector3(0, 100, 68);
-    off.multiplyScalar(s);
-    this.camera.position.copy(this.camTarget).add(off);
-    if (this.shake > 0) {
-      this.shake -= dt;
-      this.camera.position.x += rand(-1, 1) * this.shake * 3;
-      this.camera.position.z += rand(-1, 1) * this.shake * 3;
-    }
-    this.camera.lookAt(this.camTarget.x, 0, this.camTarget.z - 4);
-    const fogScale = s;
-    this.scene.fog.near = 300 * fogScale; this.scene.fog.far = 820 * fogScale;
+    this.camTarget.lerp(target, Math.min(1, dt * 3));
+    const asp = this.vw / this.vh;
+    const c = this.camera;
+    c.left = -half * asp; c.right = half * asp; c.top = half; c.bottom = -half;
+    c.updateProjectionMatrix();
+    // 원작: 남쪽에서 30도로 내려다봄
+    const el = 30 * DEG, R = 1500;
+    c.position.set(this.camTarget.x, Math.sin(el) * R, this.camTarget.z + Math.cos(el) * R);
+    if (this.shake > 0) { this.shake -= dt; c.position.x += rand(-1, 1) * this.shake * 6; c.position.y += rand(-1, 1) * this.shake * 6; }
+    c.lookAt(this.camTarget.x, 0, this.camTarget.z);
+    this.particles.uniforms.scale.value = this.vh * this.renderer.getPixelRatio() / (2 * half);
     this.updateWater(this.camTarget.x, this.camTarget.z);
   }
 
   updateAmbience(dt) {
-    if (!this.whales) return;
+    const p = this.player;
+    if (!p || !this.whales) return;
     for (const w of this.whales) {
       w.userData.h += Math.sin(this.t * 0.1 + w.position.x) * dt * 0.1;
-      w.position.x += Math.sin(w.userData.h) * 4 * dt;
-      w.position.z += Math.cos(w.userData.h) * 4 * dt;
+      w.position.x += Math.sin(w.userData.h) * 6 * dt;
+      w.position.z += Math.cos(w.userData.h) * 6 * dt;
       w.rotation.y = w.userData.h;
-      if (Math.abs(w.position.x) > 1000 || Math.abs(w.position.z) > 1000) w.userData.h += Math.PI;
+      if (Math.hypot(w.position.x - p.x, w.position.z - p.z) > 900) w.position.set(p.x + rand(-500, 500), -0.6, p.z + rand(-500, 500));
     }
-    const p = this.player;
-    if (!p) return;
     this.gulls.forEach((g, i) => {
       const u = g.userData;
       const ph = this.t * 0.35 + u.phase;
-      const cx = p.x + Math.sin(i * 2.1) * 60, cz = p.z - 30 + Math.cos(i * 1.7) * 50;
-      g.position.set(cx + Math.cos(ph) * u.r, u.h, cz + Math.sin(ph) * u.r);
+      g.position.set(p.x + Math.sin(i * 2.1) * 90 + Math.cos(ph) * u.r, u.h * 2, p.z - 40 + Math.cos(i * 1.7) * 70 + Math.sin(ph) * u.r);
       g.rotation.y = -ph;
       M.flap(g, this.t * 0.6 + i);
     });

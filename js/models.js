@@ -30,6 +30,63 @@ function canvasTex(w, h, draw) {
 }
 
 const texCache = new Map();
+// 깃발 문장 6종 (0~4 세력, 5 해적). 원작 디자인이 아닌 새 디자인
+export const EMBLEMS = [
+  { sail: 0xf4f1e6, ink: '#22a344', name: '잎새' },
+  { sail: 0xf4f1e6, ink: '#1593c9', name: '닻' },
+  { sail: 0xe8d6a8, ink: '#a8641c', name: '태양' },
+  { sail: 0xdff3fb, ink: '#3aa7c9', name: '눈꽃' },
+  { sail: 0xfbeef6, ink: '#e055b5', name: '꽃' },
+  { sail: 0x1d1d22, ink: '#e9e6dc', name: '해골' },
+];
+function drawEmblem(g, n, bg) {
+  const ink = EMBLEMS[n].ink;
+  g.fillStyle = ink; g.strokeStyle = ink; g.lineCap = 'round'; g.lineJoin = 'round';
+  g.save(); g.translate(64, 64);
+  if (n === 0) {
+    g.beginPath(); g.moveTo(0, -34); g.quadraticCurveTo(32, -8, 0, 34); g.quadraticCurveTo(-32, -8, 0, -34); g.fill();
+    g.strokeStyle = bg; g.lineWidth = 4; g.beginPath(); g.moveTo(0, -24); g.lineTo(0, 30); g.stroke();
+  } else if (n === 1) {
+    g.lineWidth = 8;
+    g.beginPath(); g.arc(0, -24, 8, 0, Math.PI * 2); g.stroke();
+    g.beginPath(); g.moveTo(0, -16); g.lineTo(0, 32); g.moveTo(-18, -4); g.lineTo(18, -4); g.stroke();
+    g.beginPath(); g.arc(0, 8, 26, 0.25 * Math.PI, 0.75 * Math.PI); g.stroke();
+  } else if (n === 2) {
+    g.beginPath(); g.arc(0, 0, 16, 0, Math.PI * 2); g.fill();
+    g.lineWidth = 6;
+    for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4; g.beginPath(); g.moveTo(Math.cos(a) * 22, Math.sin(a) * 22); g.lineTo(Math.cos(a) * 34, Math.sin(a) * 34); g.stroke(); }
+  } else if (n === 3) {
+    g.lineWidth = 6;
+    for (let i = 0; i < 3; i++) {
+      g.save(); g.rotate(i * Math.PI / 3);
+      g.beginPath(); g.moveTo(0, -34); g.lineTo(0, 34); g.stroke();
+      for (const d of [-1, 1]) { g.beginPath(); g.moveTo(0, d * 22); g.lineTo(9, d * 31); g.moveTo(0, d * 22); g.lineTo(-9, d * 31); g.stroke(); }
+      g.restore();
+    }
+  } else if (n === 4) {
+    for (let i = 0; i < 5; i++) { g.save(); g.rotate(i * Math.PI * 2 / 5); g.beginPath(); g.ellipse(0, -18, 11, 17, 0, 0, Math.PI * 2); g.fill(); g.restore(); }
+    g.fillStyle = '#f2c230'; g.beginPath(); g.arc(0, 0, 9, 0, Math.PI * 2); g.fill();
+  } else {
+    g.beginPath(); g.arc(0, -8, 22, 0, Math.PI * 2); g.fill();
+    g.fillRect(-14, 2, 28, 18);
+    g.fillStyle = bg; g.beginPath(); g.arc(-9, -8, 7, 0, Math.PI * 2); g.arc(9, -8, 7, 0, Math.PI * 2); g.fill();
+    g.fillRect(-8, 12, 3, 8); g.fillRect(-1, 12, 3, 8); g.fillRect(6, 12, 3, 8);
+    g.strokeStyle = ink; g.lineWidth = 6;
+    g.beginPath(); g.moveTo(-30, 30); g.lineTo(30, 44); g.moveTo(30, 30); g.lineTo(-30, 44); g.stroke();
+  }
+  g.restore();
+}
+export function emblemCanvas(n, size = 96) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d');
+  const col = '#' + new THREE.Color(EMBLEMS[n].sail).getHexString();
+  g.fillStyle = col; g.fillRect(0, 0, 128, 128);
+  drawEmblem(g, n, col);
+  c.style.width = c.style.height = size + 'px';
+  return c;
+}
+export function emblemTexture(n) { return sailTex(EMBLEMS[n].sail, 'emb' + n); }
 function sailTex(color, emblem) {
   const key = color + emblem;
   if (texCache.has(key)) return texCache.get(key);
@@ -52,6 +109,8 @@ function sailTex(color, emblem) {
       g.beginPath(); g.moveTo(44, 38); g.lineTo(84, 38); g.lineTo(84, 70); g.quadraticCurveTo(84, 92, 64, 100); g.quadraticCurveTo(44, 92, 44, 70); g.closePath(); g.fill();
       g.fillStyle = col;
       g.beginPath(); g.arc(64, 64, 9, 0, Math.PI * 2); g.fill();
+    } else if (emblem && emblem.startsWith('emb')) {
+      drawEmblem(g, +emblem.slice(3), col);
     } else if (emblem === 'gold') {
       g.strokeStyle = '#e8c02e'; g.lineWidth = 5;
       g.beginPath(); g.arc(64, 64, 26, 0, Math.PI * 2); g.stroke();
@@ -174,7 +233,7 @@ export function makeShip(o) {
   const guns = o.guns ?? 1;
   const slots = [];
   for (let i = 0; i < guns; i++) {
-    const z = guns === 1 ? 0 : (-0.22 + 0.44 * i / (guns - 1)) * L;
+    const z = guns === 1 ? 0 : (-0.3 + 0.6 * i / (guns - 1)) * L;
     for (const side of [-1, 1]) {
       const gx = side * (B * 0.5 + L * 0.02);
       ship.add(mesh(gunGeo, mat(0x26262b), gx, deckY - D * 0.12, z));
@@ -182,21 +241,29 @@ export function makeShip(o) {
     }
   }
 
-  // 돛대와 돛
-  const masts = o.masts ?? 1;
-  const mastZ = masts === 1 ? [0.06] : masts === 2 ? [0.2, -0.16] : [0.28, 0.02, -0.24];
+  // 돛대와 돛: mastList = [{ z(L 비율), h(L 비율), rows, wide }]
+  let mastList = o.mastList;
+  if (!mastList) {
+    const masts = o.masts ?? 1;
+    const mz = masts === 1 ? [0.06] : masts === 2 ? [0.2, -0.16] : [0.28, 0.02, -0.24];
+    mastList = mz.map((z, idx) => {
+      const h = (idx === Math.floor(masts / 2) ? 0.95 : 0.8) * (o.mastScale ?? 1);
+      return { z, h, rows: h > 0.7 ? 3 : 2, wide: o.sailWide ?? 1 };
+    });
+  }
   const sailMat = new THREE.MeshLambertMaterial({ map: sailTex(o.sail, o.emblem ?? 'none'), side: THREE.DoubleSide, flatShading: true });
   const sails = [];
-  mastZ.forEach((mz, idx) => {
-    const H = L * (idx === Math.floor(masts / 2) ? 0.95 : 0.8) * (o.mastScale ?? 1);
-    const z = mz * L;
+  mastList.forEach((m, idx) => {
+    const H = L * m.h;
+    const z = m.z * L;
     ship.add(mesh(new THREE.CylinderGeometry(L * 0.012, L * 0.018, H, 5), mat(0x6b4423), 0, deckY + H / 2, z));
     ship.add(mesh(new THREE.ConeGeometry(L * 0.02, L * 0.06, 5), mat(o.trim), 0, deckY + H + L * 0.03, z));
-    const rows = H > L * 0.7 ? 3 : 2;
+    const rows = m.rows;
+    const rowH = H * 0.78 / rows;
     for (let r = 0; r < rows; r++) {
-      const w = B * (1.25 - r * 0.22) * (o.sailWide ?? 1);
-      const sh = H * 0.27;
-      const y = deckY + H * 0.22 + r * H * 0.27 + sh / 2;
+      const w = B * (1.25 - r * 0.22) * m.wide;
+      const sh = rowH * 0.95;
+      const y = deckY + H * 0.2 + r * rowH + sh / 2;
       const geo = new THREE.BoxGeometry(w, sh, L * 0.01, 3, 2, 1);
       // 바람을 받은 듯 앞쪽으로 볼록
       const p = geo.attributes.position;
@@ -213,13 +280,40 @@ export function makeShip(o) {
       yard.rotation.z = Math.PI / 2;
       ship.add(yard);
     }
-    if (idx === 0 || masts === 1) {
+    if (idx === 0) {
       const flag = mesh(new THREE.PlaneGeometry(L * 0.09, L * 0.05), new THREE.MeshLambertMaterial({ color: o.flag ?? 0x1d1d22, side: THREE.DoubleSide }), 0, deckY + H + L * 0.02, z - L * 0.05);
       flag.rotation.y = Math.PI / 2;
       ship.add(flag);
       root.userData.flag = flag;
     }
   });
+
+  // 뱃머리 장식 (선회 레벨)
+  if (o.head) {
+    const hc = o.head.color, hs = o.head.size;
+    const fig = mesh(new THREE.ConeGeometry(B * 0.16 * hs, L * 0.16 * hs, 5), mat(hc, { emissive: o.head.glow ?? 0x000000 }), 0, deckY + L * 0.04, L * 0.52);
+    fig.rotation.x = Math.PI / 2 - 0.3;
+    ship.add(fig);
+    if (o.head.wings) for (const side of [-1, 1]) {
+      const wgt = mesh(new THREE.ConeGeometry(L * 0.025 * hs, L * 0.12 * hs, 3), mat(hc), side * B * 0.14, deckY + L * 0.09, L * 0.46);
+      wgt.rotation.z = side * 0.9; wgt.rotation.x = -0.3;
+      ship.add(wgt);
+    }
+  }
+  // 노 (작은 배)
+  if (o.oars) {
+    const oars = [];
+    for (let i = 0; i < o.oars; i++) for (const side of [-1, 1]) {
+      const piv = new THREE.Group();
+      piv.position.set(side * B * 0.48, deckY, (-0.15 + 0.3 * i / Math.max(1, o.oars - 1)) * L);
+      const oar = mesh(new THREE.BoxGeometry(L * 0.012, L * 0.012, L * 0.32), mat(0x9a6b3c), side * L * 0.1, -L * 0.04, 0);
+      oar.rotation.y = side * 1.2; oar.rotation.z = side * 0.4;
+      piv.add(oar);
+      ship.add(piv);
+      oars.push({ piv, side, ph: i * 0.7 });
+    }
+    root.userData.oars = oars;
+  }
 
   if (o.dragon) {
     // 뱃전 가시와 금색 용머리
@@ -251,12 +345,47 @@ export function makeShip(o) {
   return root;
 }
 
-export function playerShipLook(bodyLvl) {
-  if (bodyLvl < 6) return { tier: 0, len: 13, masts: 1, sail: 0xe4ecf6, emblem: 'crest', hull: 0x8b5a2b, band: 0x1e2340, trim: 0xe8c02e, flag: 0xffffff };
-  if (bodyLvl < 14) return { tier: 1, len: 16, masts: 2, sail: 0xe4ecf6, emblem: 'crest', hull: 0x8b5a2b, band: 0x1e2340, trim: 0xe8c02e, flag: 0xffffff };
-  if (bodyLvl < 24) return { tier: 2, len: 20, masts: 3, sail: 0xe4ecf6, emblem: 'crest', hull: 0x8b5a2b, band: 0x1e2340, trim: 0xe8c02e, flag: 0xffffff };
-  return { tier: 3, len: 25, masts: 3, sail: 0x1d1d22, emblem: 'gold', hull: 0x9a6a36, band: 0x2a1f14, trim: 0xf2c230, flag: 0x1d1d22, sailWide: 1.1 };
+// 선체/돛/선회 레벨로 배 모양을 정한다 (원작 구조를 따름)
+const HULL_STYLE = [
+  { hull: 0x9a6b3c, band: null, trim: 0x6b4423 },
+  { hull: 0x9a6b3c, band: null, trim: 0x6b4423 },
+  { hull: 0x8b5a2b, band: null, trim: 0xc9a046 },
+  { hull: 0x8b5a2b, band: 0x1e2340, trim: 0xe8c02e },
+  { hull: 0x8b5a2b, band: 0x1e2340, trim: 0xe8c02e },
+  { hull: 0x7a4e2b, band: 0x2a3a6b, trim: 0xe8c02e },
+  { hull: 0x7a4e2b, band: 0x2a3a6b, trim: 0xf2c230 },
+  { hull: 0x6e4526, band: 0x3a2f5c, trim: 0xf2c230 },
+  { hull: 0x5b3a22, band: 0x3a2f5c, trim: 0xf2c230 },
+  { hull: 0x9a6a36, band: 0x2a1f14, trim: 0xf2c230 },
+];
+const HEAD_COLORS = [0x9a6b3c, 0xc07a3a, 0xc9ccd2, 0xf2c230, 0xd8342c];
+export function boatLook({ body, sail, steer, emblem, hulls, K }) {
+  const [len, beam] = hulls[body - 1];
+  const set = SAIL_SETS[Math.max(0, Math.min(49, sail - 1))];
+  // [3번(선미), 2번(앞), 1번(주), 4번(뱃머리)] 돛대 변형 -> 크기와 단수
+  const maxV = [6, 11, 26, 6];
+  const pos = [-0.3, 0.27, 0.02, 0.42];
+  const mastList = [];
+  [2, 1, 0, 3].forEach(k => {
+    const v = set[k];
+    if (!v) return;
+    const f = v / maxV[k];
+    const main = k === 2;
+    mastList.push({ z: pos[k], h: (main ? 0.75 : 0.6) + f * (main ? 0.45 : 0.3), rows: v >= maxV[k] * 0.6 ? 3 : v >= maxV[k] * 0.25 ? 2 : 1, wide: 0.75 + f * 0.45 });
+  });
+  if (!mastList.length) mastList.push({ z: 0.02, h: 0.75, rows: 1, wide: 0.7 });
+  const st = HULL_STYLE[body - 1];
+  const tier = Math.min(4, Math.floor((steer - 1) / 10));
+  return {
+    len: len * K, beam: beam * K * 1.2, depth: beam * K * 0.6,
+    mastList, sail: EMBLEMS[emblem].sail, emblem: 'emb' + emblem, flag: emblem === 5 ? 0x1d1d22 : 0xffffff,
+    hull: st.hull, band: st.band, trim: st.trim,
+    head: { color: HEAD_COLORS[tier], size: 0.7 + ((steer - 1) % 10) * 0.05 + tier * 0.1, wings: tier >= 2, glow: tier >= 4 ? 0x401010 : 0 },
+    oars: body <= 2 ? 2 : 0,
+  };
 }
+let SAIL_SETS = [[0, 0, 1, 0]];
+export function setSailSets(s) { SAIL_SETS = s; }
 
 // ---------- 크라켄 ----------
 export function makeKraken() {
@@ -450,7 +579,7 @@ export function makeIsland(def) {
   const g = new THREE.Group();
   const top = 5;
   const segs = 11;
-  const grassCol = def.deco === 'ice' ? 0xe8f2f7 : def.deco === 'volcano' ? 0x6b7a3a : def.deco === 'skull' ? 0x7f8f5a : def.deco === 'dokdo' ? 0x5f9a45 : 0x5cb848;
+  const grassCol = def.ground ?? (def.deco === 'ice' ? 0xe8f2f7 : def.deco === 'volcano' ? 0x6b7a3a : def.deco === 'skull' ? 0x7f8f5a : def.deco === 'dokdo' ? 0x5f9a45 : 0x5cb848);
   const dirtCol = def.deco === 'ice' ? 0xa9cfe0 : 0x8a6a45;
   const base = new THREE.Mesh(jitterRadial(new THREE.CylinderGeometry(R, R * 1.06, 7, segs), hashStr(def.id), 0.12), [mat(dirtCol), mat(grassCol), mat(dirtCol)]);
   base.position.y = top - 3.5;
@@ -464,7 +593,7 @@ export function makeIsland(def) {
   dock.add(plank);
   for (const dx of [-3, 3]) for (const dz of [0, 8, 16]) dock.add(mesh(new THREE.CylinderGeometry(0.45, 0.45, 4, 5), mat(0x6b4423), dx, 0.6, R + dz));
   g.add(dock);
-  g.userData.dockOffset = { x: 0, z: R + 26 };
+  g.userData.dockGroup = dock;
 
   const place = (minR = 0.1, maxR = 0.72) => {
     const a = r() * Math.PI * 2, d = R * (minR + r() * (maxR - minR));
@@ -631,10 +760,10 @@ export function makeIsland(def) {
   return g;
 }
 
-export function setIslandOwned(island, owned) {
+export function setIslandOwned(island, owned, playerEmblem = 0, faction = 0) {
   const f = island.getObjectByName('ownerFlagCloth');
   if (!f) return;
-  f.material = new THREE.MeshLambertMaterial({ map: owned ? ownFlag() : pirateFlag(), side: THREE.DoubleSide });
+  f.material = new THREE.MeshLambertMaterial({ map: emblemTexture(owned ? playerEmblem : faction), side: THREE.DoubleSide });
 }
 
 // ---------- 소품 ----------
@@ -661,6 +790,14 @@ export function makeBuoy(color) {
 }
 
 export function makeLoot(kind) {
+  if (kind === 'gift') {
+    const g = new THREE.Group();
+    g.add(mesh(new THREE.BoxGeometry(3, 2.6, 3), mat(0xe04848), 0, 0.9, 0));
+    g.add(mesh(new THREE.BoxGeometry(3.1, 2.7, 0.6), mat(0xf2c230), 0, 0.9, 0));
+    g.add(mesh(new THREE.BoxGeometry(0.6, 2.7, 3.1), mat(0xf2c230), 0, 0.9, 0));
+    g.add(mesh(new THREE.TorusGeometry(0.7, 0.25, 5, 8), mat(0xf2c230), 0, 2.6, 0));
+    return g;
+  }
   if (kind === 'coin') {
     const g = new THREE.Group();
     for (let i = 0; i < 3; i++) {
