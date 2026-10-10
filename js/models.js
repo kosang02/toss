@@ -3,10 +3,16 @@ import * as THREE from './three.module.min.js';
 import { rng, hashStr } from './data.js';
 
 const matCache = new Map();
+let LOW = false;
+export function setLowQuality(v) { LOW = v; }
+const GOLDS = new Set([0xe8c02e, 0xf2c230, 0xd9b23a, 0xe0b53c, 0xc9a046, 0xc9ccd2, 0xc07a3a]);
 export function mat(color, opts = {}) {
   const key = color + JSON.stringify(opts);
   if (!matCache.has(key)) {
-    matCache.set(key, new THREE.MeshLambertMaterial({ color, flatShading: true, ...opts }));
+    const m = LOW
+      ? new THREE.MeshLambertMaterial({ color, flatShading: true, ...opts })
+      : new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: GOLDS.has(color) ? 0.35 : 0.82, metalness: GOLDS.has(color) ? 0.55 : 0, ...opts });
+    matCache.set(key, m);
   }
   return matCache.get(key);
 }
@@ -251,7 +257,11 @@ export function makeShip(o) {
       return { z, h, rows: h > 0.7 ? 3 : 2, wide: o.sailWide ?? 1 };
     });
   }
-  const sailMat = new THREE.MeshLambertMaterial({ map: sailTex(o.sail, o.emblem ?? 'none'), side: THREE.DoubleSide, flatShading: true });
+  const sailKey = 'sail' + o.sail + (o.emblem ?? 'none');
+  if (!matCache.has(sailKey)) matCache.set(sailKey, LOW
+    ? new THREE.MeshLambertMaterial({ map: sailTex(o.sail, o.emblem ?? 'none'), side: THREE.DoubleSide })
+    : new THREE.MeshStandardMaterial({ map: sailTex(o.sail, o.emblem ?? 'none'), side: THREE.DoubleSide, roughness: 0.95 }));
+  const sailMat = matCache.get(sailKey);
   const sails = [];
   mastList.forEach((m, idx) => {
     const H = L * m.h;
@@ -887,4 +897,52 @@ export function makeReflection(obj) {
   r.scale.y = -1;
   r.traverse(o => { if (o.isMesh) { o.castShadow = false; } });
   return r;
+}
+
+// ---------- 그래픽 보조 ----------
+export function enableShadows(obj, cast = true, receive = false) {
+  obj.traverse(o => { if (o.isMesh) { o.castShadow = cast; o.receiveShadow = receive; } });
+}
+
+// 섬 둘레 파도 거품 (반지 모양, 셰이더로 밀려오는 물결)
+const foamTimeU = { value: 0 };
+const FOAM_VS = `varying vec2 vP; void main(){ vP = position.xy; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`;
+const FOAM_FS = `uniform float time; uniform float inner; uniform float outer; varying vec2 vP;
+  void main(){
+    float r = length(vP); float a = atan(vP.y, vP.x);
+    float t = clamp((r - inner) / (outer - inner), 0.0, 1.0);
+    float wob = sin(a*7.0 + time*0.7)*0.05 + sin(a*13.0 - time*1.1)*0.03;
+    float band = 0.5 + 0.5*sin((t + wob)*20.0 - time*2.2);
+    float edge = 1.0 - smoothstep(0.0, 0.18, abs(t - 0.06 - wob));
+    float alpha = (pow(1.0 - t, 2.0) * smoothstep(0.7, 1.0, band) * 0.4 + edge * 0.6) * (1.0 - smoothstep(0.8, 1.0, t));
+    gl_FragColor = vec4(vec3(1.0), alpha);
+  }`;
+export function makeShoreFoam(R) {
+  const inner = R * 0.98, outer = R * 1.3;
+  const m = new THREE.ShaderMaterial({
+    uniforms: { time: foamTimeU, inner: { value: inner }, outer: { value: outer } },
+    vertexShader: FOAM_VS, fragmentShader: FOAM_FS, transparent: true, depthWrite: false,
+  });
+  const ring = new THREE.Mesh(new THREE.RingGeometry(inner, outer, 64, 1), m);
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.35;
+  ring.renderOrder = 3;
+  return ring;
+}
+export function foamTime(t) { foamTimeU.value = t; }
+
+let cloudTex;
+export function cloudShadowTexture() {
+  if (cloudTex) return cloudTex;
+  cloudTex = canvasTex(256, 256, (g, w, h) => {
+    const r = rng(23);
+    for (let i = 0; i < 14; i++) {
+      const x = 60 + r() * 136, y = 60 + r() * 136, rad = 30 + r() * 50;
+      const grd = g.createRadialGradient(x, y, 0, x, y, rad);
+      grd.addColorStop(0, 'rgba(0,0,0,0.55)'); grd.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = grd; g.fillRect(0, 0, w, h);
+    }
+  });
+  cloudTex.colorSpace = THREE.NoColorSpace;
+  return cloudTex;
 }

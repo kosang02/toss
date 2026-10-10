@@ -14,6 +14,8 @@ const lerp = (a, b, t) => a + (b - a) * Math.min(1, t);
 const rand = (a, b) => a + Math.random() * (b - a);
 const INERTIA = 0.8;                 // 회전 관성 계수 (질량 × 이 값)
 export const ISLAND_R = 22 * K;      // 섬 크기
+const FIRE_RANGE = 38 * K;           // 내 대포 사거리
+const BALL_SPEED = 26 * K;           // 내 포탄 속도
 // 선체별 사격 범위 상자 [중심 옆거리, 옆 폭, 앞뒤 길이] (원작 단위)
 const ATK_BOX = [[9, 15, 4], [9, 15, 4], [9, 15, 4.92], [10, 15, 5.57], [10, 15, 5.6], [10, 16, 6.6], [10, 16, 6.8], [10.5, 17, 7.41], [10.5, 17, 8.88], [11, 19, 10]];
 
@@ -95,6 +97,7 @@ class Ship {
   setModel(model) {
     while (this.obj.children.length) this.obj.remove(this.obj.children[0]);
     this.model = model;
+    M.enableShadows(model, true, false);
     this.obj.add(model);
     this.refl = M.makeReflection(model);
     this.obj.add(this.refl);
@@ -130,6 +133,13 @@ class Ship {
       this.model.rotation.z = clamp(this.d, -10, 10) * DEG * 0.8;
       this.model.rotation.x = clamp(this.e * 0.5, -5, 5) * DEG;
       if (this.refl) { this.refl.rotation.copy(this.model.rotation); this.refl.visible = !this.dead; }
+      const sails = this.model.userData.sails;
+      if (sails) {
+        const wind = 0.75 + Math.min(1, this.speed() / 15) * 0.35;
+        for (let i = 0; i < sails.length; i++) sails[i].scale.z = wind + Math.sin(t * 2.4 + i * 0.9 + this.x * 0.01) * 0.12;
+      }
+      const flag = this.model.userData.flag;
+      if (flag) flag.rotation.y = Math.PI / 2 + Math.sin(t * 7 + this.z * 0.02) * 0.35;
       const oars = this.model.userData.oars;
       if (oars) for (const o of oars) o.piv.rotation.y = Math.sin(t * (2 + this.speed() * 0.05) + o.ph) * 0.5 * Math.min(1, this.speed() / 10) * o.side;
     }
@@ -166,16 +176,32 @@ export class Game {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    let q = 'high';
+    try { q = localStorage.getItem('dokdo-quality') || 'high'; } catch (e) { /* */ }
+    this.low = q === 'low';
+    M.setLowQuality(this.low);
+    if (this.low) this.renderer.setPixelRatio(1);
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.15;
+    this.renderer.shadowMap.enabled = !this.low;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x1d6a93);
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 4000);
     this.camSize = 15;
     this.camSizeTarget = 15;
 
-    this.scene.add(new THREE.HemisphereLight(0xdff2ff, 0x2a5a78, 1.1));
-    const sun = new THREE.DirectionalLight(0xffffff, 1.6);
-    sun.position.set(0, 39.2, 35.4); // 원작: 남쪽 위에서 45도
+    this.scene.add(new THREE.HemisphereLight(0xe6f4ff, 0x2a5a78, 1.25));
+    const sun = new THREE.DirectionalLight(0xfff4e0, 2.2);
+    sun.position.set(-20, 39.2, 35.4); // 원작: 남쪽 위에서 45도
+    sun.castShadow = !this.low;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.bias = -0.0008;
+    sun.shadow.normalBias = 0.6;
+    sun.shadow.camera.near = 1; sun.shadow.camera.far = 1200;
+    this.sun = sun;
     this.scene.add(sun);
+    this.scene.add(sun.target);
 
     this.makeWater();
     this.particles = new Particles(this.scene);
@@ -193,6 +219,7 @@ export class Game {
     this.krakens = [];
     this.helpers = [];
     this.near = [];
+    this.pending = [];
     this.paused = true;
     this.input = { touch: false, heading: 0, sx: 0, sy: 0, cx: 0, cy: 0, keys: new Set(), lastTap: 0, pinch: null, moved: false };
     this.auto = false;
@@ -309,35 +336,76 @@ export class Game {
 
   // ---------- 바다 ----------
   makeWater() {
-    const size = 3000;
-    this.waterTex = M.waterTexture();
-    this.waterTex.wrapS = this.waterTex.wrapT = THREE.RepeatWrapping;
-    this.waterRepeat = 18;
-    this.waterTex.repeat.set(this.waterRepeat, this.waterRepeat);
+    const size = 3200;
+    const noise = M.waterTexture(), caus = M.causticTexture();
+    for (const t of [noise, caus]) t.wrapS = t.wrapT = THREE.RepeatWrapping;
     const geo = new THREE.PlaneGeometry(size, size);
     geo.rotateX(-Math.PI / 2);
-    this.water = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: this.waterTex, transparent: true, opacity: 0.8 }));
+    this.waterU = { time: { value: 0 }, tNoise: { value: noise }, tCaus: { value: caus }, deep: { value: new THREE.Color(0x14639a) }, shallow: { value: new THREE.Color(0x45b2d8) }, alpha: { value: 0.87 } };
+    this.water = new THREE.Mesh(geo, new THREE.ShaderMaterial({
+      uniforms: this.waterU, transparent: true,
+      vertexShader: `varying vec2 vW; void main(){ vec4 w = modelMatrix*vec4(position,1.0); vW = w.xz; gl_Position = projectionMatrix*viewMatrix*w; }`,
+      fragmentShader: `uniform sampler2D tNoise; uniform sampler2D tCaus; uniform float time; uniform vec3 deep; uniform vec3 shallow; uniform float alpha; varying vec2 vW;
+        void main(){
+          vec2 uv = vW / 180.0;
+          vec2 d = vec2(sin(uv.y*3.1 + time*0.6), cos(uv.x*2.7 + time*0.5)) * 0.025;
+          float n1 = texture2D(tNoise, uv*0.55 + vec2(time*0.010, time*0.006) + d).g;
+          float n2 = texture2D(tNoise, uv*1.25 - vec2(time*0.008, -time*0.012) - d).g;
+          float c1 = texture2D(tCaus, uv*2.1 + vec2(time*0.030, time*0.020) + d*2.0).a;
+          float c2 = texture2D(tCaus, uv*1.6 - vec2(time*0.024, -time*0.016) - d*2.0).a;
+          float caus = min(c1, c2) * 1.6 + (c1 + c2) * 0.18;
+          vec3 col = mix(deep, shallow, smoothstep(0.42, 0.62, (n1 + n2) * 0.5));
+          col += caus * 0.45;
+          float glint = pow(max(0.0, sin(vW.x*0.35 + time*2.3) * sin(vW.y*0.31 - time*1.9)), 60.0) * smoothstep(0.5, 0.7, n2);
+          col += glint * 0.9;
+          gl_FragColor = vec4(col, alpha);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }`,
+    }));
     this.water.renderOrder = 1;
     this.scene.add(this.water);
-    this.causTex = M.causticTexture();
-    this.causTex.wrapS = this.causTex.wrapT = THREE.RepeatWrapping;
-    this.causRepeat = 30;
-    this.causTex.repeat.set(this.causRepeat, this.causRepeat);
-    this.caustic = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: this.causTex, transparent: true, opacity: 0.5, depthWrite: false, blending: THREE.AdditiveBlending }));
-    this.caustic.renderOrder = 2;
-    this.scene.add(this.caustic);
-    this.waterSize = size;
+    // 바다 위 그림자
+    this.shadowCatcher = new THREE.Mesh(geo, new THREE.ShadowMaterial({ opacity: 0.22, depthWrite: false }));
+    this.shadowCatcher.position.y = 0.2;
+    this.shadowCatcher.receiveShadow = true;
+    this.shadowCatcher.renderOrder = 2;
+    this.shadowCatcher.visible = !this.low;
+    this.scene.add(this.shadowCatcher);
+    // 대포 사거리 표시
+    this.rangeRing = new THREE.Mesh(new THREE.RingGeometry(FIRE_RANGE - 1.5, FIRE_RANGE + 1.5, 96), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, depthWrite: false }));
+    this.rangeRing.rotation.x = -Math.PI / 2;
+    this.rangeRing.position.y = 0.5;
+    this.rangeRing.renderOrder = 4;
+    this.scene.add(this.rangeRing);
+    // 구름 그림자
+    this.clouds = [];
+    const ctex = M.cloudShadowTexture();
+    for (let i = 0; i < 6; i++) {
+      const sz = rand(260, 520);
+      const c = new THREE.Mesh(new THREE.PlaneGeometry(sz, sz * rand(0.6, 0.9)), new THREE.MeshBasicMaterial({ map: ctex, transparent: true, opacity: 0.32, depthWrite: false, color: 0x062a44 }));
+      c.rotation.x = -Math.PI / 2;
+      c.rotation.z = rand(0, TAU);
+      c.position.set(rand(-900, 900), 0.4, rand(-900, 900));
+      c.renderOrder = 3;
+      this.scene.add(c);
+      this.clouds.push(c);
+    }
   }
-  updateWater(cx, cz) {
+  updateWater(cx, cz, dt) {
     const snap = 40;
     const x = Math.round(cx / snap) * snap, z = Math.round(cz / snap) * snap;
     this.water.position.set(x, 0, z);
-    this.caustic.position.set(x, 0.05, z);
-    const tile = this.waterSize / this.waterRepeat;
-    this.waterTex.offset.set(x / tile + this.t * 0.004, -z / tile + this.t * 0.002);
-    const ct = this.waterSize / this.causRepeat;
-    this.causTex.offset.set(x / ct - this.t * 0.012, -z / ct + this.t * 0.007);
-    this.caustic.material.opacity = 0.4 + Math.sin(this.t * 0.9) * 0.12;
+    this.shadowCatcher.position.set(x, 0.2, z);
+    this.waterU.time.value = this.t;
+    M.foamTime(this.t);
+    for (const c of this.clouds) {
+      c.position.x += 9 * dt; c.position.z -= 4 * dt;
+      if (c.position.x - cx > 1000) c.position.x -= 2000;
+      if (c.position.x - cx < -1000) c.position.x += 2000;
+      if (c.position.z - cz > 1000) c.position.z -= 2000;
+      if (c.position.z - cz < -1000) c.position.z += 2000;
+    }
   }
 
   // ---------- 월드 ----------
@@ -363,7 +431,9 @@ export class Game {
       const obj = M.makeIsland({ id: 'isl' + isl.i, r: ISLAND_R / 1.15, deco: this.decoFor(isl), ground: D.FACTIONS[isl.fac].ground });
       obj.position.set(isl.x, 0, isl.z);
       if (obj.userData.dockGroup) obj.userData.dockGroup.rotation.y = dockDir;
+      M.enableShadows(obj, true, true);
       this.world.add(obj);
+      const foam = M.makeShoreFoam(ISLAND_R * 1.02); foam.position.set(isl.x, 0.35, isl.z); this.world.add(foam);
       const refl = M.makeReflection(obj); refl.position.copy(obj.position); this.world.add(refl);
       const dock = { x: isl.x + Math.sin(dockDir) * (ISLAND_R + 20), z: isl.z + Math.cos(dockDir) * (ISLAND_R + 20) };
       const rec = { def: isl, obj, refl, x: isl.x, z: isl.z, dock, defenders: [], gen: false };
@@ -378,6 +448,8 @@ export class Game {
     if (s.world === 0) {
       const dk = M.makeIsland({ id: 'dokdo', r: ISLAND_R * 0.9, deco: 'dokdo', ground: 0x5f9a45 });
       dk.position.set(D.DOKDO.x, 0, D.DOKDO.z);
+      M.enableShadows(dk, true, true);
+      const dfoam = M.makeShoreFoam(ISLAND_R * 0.95); dfoam.position.set(D.DOKDO.x, 0.35, D.DOKDO.z); this.world.add(dfoam);
       if (dk.userData.dockGroup) dk.userData.dockGroup.visible = false;
       this.world.add(dk);
       const dr = M.makeReflection(dk); dr.position.copy(dk.position); this.world.add(dr);
@@ -582,6 +654,7 @@ export class Game {
 
   step(dt) {
     this.t += dt;
+    for (let i = this.pending.length - 1; i >= 0; i--) if (this.pending[i].at <= this.t) { const f = this.pending[i].fn; this.pending.splice(i, 1); f(); }
     this.state.time += dt;
     this.updatePlayer(dt);
     this.updateEnemies(dt);
@@ -664,7 +737,8 @@ export class Game {
     p.wakeT = (p.wakeT || 0) - dt;
     if (p.speed() > 2 && p.wakeT <= 0) { p.wakeT = 0.06; this.wake(p); }
     // 포탑
-    this.near = this.enemies.filter(e => !e.dead && p.inAtkBox(e.x, e.z, s.lv.body) !== 0);
+    // 사격 판정: 원작의 좁은 측면 상자 대신 넉넉한 사거리 안의 적
+    this.near = this.enemies.filter(e => !e.dead && Math.hypot(e.x - p.x, e.z - p.z) < FIRE_RANGE + e.len * 0.5);
     for (const tu of p.turrets) this.updateTurret(p, tu, dt);
     // 들이받기: 서로 상대 선체 레벨만큼 피해
     for (const e of this.enemies) {
@@ -702,7 +776,7 @@ export class Game {
     const bx = sh.x - Math.sin(sh.heading) * L * 0.45, bz = sh.z - Math.cos(sh.heading) * L * 0.45;
     for (const sd of [-1, 1]) {
       const sx = Math.cos(sh.heading) * sd * sh.beam * 0.4, sz = -Math.sin(sh.heading) * sd * sh.beam * 0.4;
-      this.particles.emit({ x: bx + sx, y: 0.3, z: bz + sz, vx: sx * 0.3, vz: sz * 0.3, life: 1.1, size: L * 0.14, grow: L * 0.2, color: 0xe6f6ff, alpha: 0.38 });
+      this.particles.emit({ x: bx + sx, y: 0.3, z: bz + sz, vx: sx * 0.3, vz: sz * 0.3, life: 1.0, size: L * 0.12, grow: L * 0.16, color: 0xe6f6ff, alpha: 0.28 });
     }
   }
 
@@ -725,28 +799,36 @@ export class Game {
     }
   }
 
-  // 포탑 하나: 측면 시야 50도 안의 적을 좌우 40도까지 조준, 2.8초마다 한 발
+  // 포탑 하나: 측면 70도 안의 적을 좌우 55도까지 조준, 2.8초마다 한 발.
+  // 적이 움직일 곳을 예측하고, 거리에 맞춰 포각을 정한다.
   updateTurret(p, tu, dt) {
     const pos = p.toWorld(tu.lx, tu.lz);
     const face = p.heading + tu.side * Math.PI / 2;
     let target = null, best = Infinity;
     for (const e of this.near) {
       const a = Math.atan2(e.x - pos.x, e.z - pos.z);
-      if (Math.abs(wrap(a - face)) < 50 * DEG) {
-        const d = Math.hypot(e.x - pos.x, e.z - pos.z);
-        if (d < best) { best = d; target = e; }
-      }
+      const d = Math.hypot(e.x - pos.x, e.z - pos.z);
+      if (Math.abs(wrap(a - face)) < 70 * DEG && d < FIRE_RANGE + e.len * 0.5 && d < best) { best = d; target = e; }
     }
-    if (!target) { tu.t = 0.5; return; }
+    if (!target) { tu.t = Math.min(tu.t, 0.4); return; }
     tu.t -= dt;
     if (tu.t > 0) return;
     tu.t = 2.8;
-    const yaw = face + clamp(wrap(Math.atan2(target.x - pos.x, target.z - pos.z) - face), -40 * DEG, 40 * DEG);
-    setTimeout(() => {
-      if (p.dead || this.parked != null) return;
+    // 원작처럼 0.1초 뒤 발사 (게임 시간 기준)
+    this.pending.push({ at: this.t + 0.1, fn: () => {
+      if (p.dead || this.parked != null || target.dead) return;
       const pp = p.toWorld(tu.lx, tu.lz);
-      this.fire(pp.x, 1.6 * K, pp.z, yaw, 10 * DEG, 24 * K, D.atk(this.state.lv.cannon), 'player');
-    }, 100);
+      const v = BALL_SPEED;
+      let tx = target.x, tz = target.z, pitch = 10 * DEG;
+      for (let i = 0; i < 3; i++) {
+        const d = Math.hypot(tx - pp.x, tz - pp.z);
+        pitch = 0.5 * Math.asin(clamp(D.G * d / (v * v), 0, 1));
+        const tf = d / (v * Math.cos(pitch));
+        tx = target.x + target.vx * tf; tz = target.z + target.vz * tf;
+      }
+      const yaw = face + clamp(wrap(Math.atan2(tx - pp.x, tz - pp.z) - face), -55 * DEG, 55 * DEG);
+      this.fire(pp.x, 1.6 * K, pp.z, yaw, pitch, v, D.atk(this.state.lv.cannon), 'player');
+    } });
   }
 
   fire(x, y, z, yaw, pitch, speed, atk, team) {
@@ -755,8 +837,9 @@ export class Game {
     this.scene.add(mesh);
     const h = Math.cos(pitch) * speed;
     this.bullets.push({ mesh, x, y, z, vx: Math.sin(yaw) * h, vy: Math.sin(pitch) * speed, vz: Math.cos(yaw) * h, atk, team, t: 0 });
-    for (let k = 0; k < 3; k++) this.particles.emit({ x, y, z, vx: Math.sin(yaw) * rand(5, 15), vy: rand(2, 6), vz: Math.cos(yaw) * rand(5, 15), life: 0.9, size: 3, grow: 6, color: 0xd8d8d8, alpha: 0.7, drag: 2 });
-    this.particles.emit({ x, y, z, life: 0.12, size: 4, color: 0xffc040 });
+    for (let k = 0; k < 5; k++) this.particles.emit({ x, y, z, vx: Math.sin(yaw) * rand(8, 22) + rand(-3, 3), vy: rand(2, 8), vz: Math.cos(yaw) * rand(8, 22) + rand(-3, 3), life: 1.2, size: 3.5, grow: 9, color: 0xe8e8e8, alpha: 0.75, drag: 2.5 });
+    this.particles.emit({ x: x + Math.sin(yaw) * 3, y, z: z + Math.cos(yaw) * 3, life: 0.1, size: 9, color: 0xfff1b0 });
+    this.particles.emit({ x: x + Math.sin(yaw) * 5, y, z: z + Math.cos(yaw) * 5, life: 0.16, size: 6, color: 0xff9a30 });
     const far = Math.hypot(x - this.player.x, z - this.player.z);
     if (far < 400) this.sound.play('cannon', (team === 'enemy' ? 0.25 : 0.4) * (1 - far / 450), clamp((x - this.player.x) / 200, -1, 1));
   }
@@ -794,6 +877,8 @@ export class Game {
   }
 
   boom(x, y, z, color) {
+    this.particles.emit({ x, y, z, life: 0.14, size: 14, color: 0xfff1b0 });
+    for (let k = 0; k < 6; k++) this.particles.emit({ x, y, z, vx: rand(-25, 25), vy: rand(10, 30), vz: rand(-25, 25), grav: 50, life: 0.5, size: 1.2, color: 0xffe080 });
     for (let k = 0; k < 10; k++) this.particles.emit({ x, y, z, vx: rand(-15, 15), vy: rand(6, 24), vz: rand(-15, 15), grav: 40, life: 0.6, size: 1.8, color: k % 2 ? color : 0x5a3a20 });
     for (let k = 0; k < 3; k++) this.particles.emit({ x, y: y + 4, z, vy: 4, life: 1.2, size: 5, grow: 8, color: 0x555555, alpha: 0.6 });
     const far = Math.hypot(x - this.player.x, z - this.player.z);
@@ -957,6 +1042,10 @@ export class Game {
     this.state.kills++;
     this.sound.play('explode', 0.5);
     for (let k = 0; k < 26; k++) this.particles.emit({ x: e.x + rand(-8, 8), y: 8, z: e.z + rand(-8, 8), vx: rand(-20, 20), vy: rand(8, 30), vz: rand(-20, 20), grav: 30, life: 1.1, size: 3, color: k % 3 ? 0xff8a30 : 0x2a2a2a });
+    for (let k = 0; k < 4; k++) this.particles.emit({ x: e.x + rand(-6, 6), y: 6, z: e.z + rand(-6, 6), life: 0.35, size: 18 + k * 4, grow: 20, color: k % 2 ? 0xffb040 : 0xffe9a0, alpha: 0.9 });
+    for (let k = 0; k < 10; k++) this.particles.emit({ x: e.x, y: 6, z: e.z, vx: rand(-30, 30), vy: rand(15, 35), vz: rand(-30, 30), grav: 45, life: 1.4, size: 2.2, color: 0x7a5230 });
+    for (let k = 0; k < 6; k++) this.particles.emit({ x: e.x + rand(-6, 6), y: 10, z: e.z + rand(-6, 6), vy: 6, life: 3, size: 10, grow: 10, color: 0x3a3a3a, alpha: 0.55 });
+    this.shake = Math.max(this.shake || 0, 0.15);
     if (e.home) e.home.defenders = e.home.defenders.filter(x => x !== e);
     if (this.arena) { this.arena.kills++; return; }
     // 떠다니는 상자 2~4개, 상자마다 따로 굴림
@@ -1355,7 +1444,17 @@ export class Game {
     if (this.shake > 0) { this.shake -= dt; c.position.x += rand(-1, 1) * this.shake * 6; c.position.y += rand(-1, 1) * this.shake * 6; }
     c.lookAt(this.camTarget.x, 0, this.camTarget.z);
     this.particles.uniforms.scale.value = this.vh * this.renderer.getPixelRatio() / (2 * half);
-    this.updateWater(this.camTarget.x, this.camTarget.z);
+    this.updateWater(this.camTarget.x, this.camTarget.z, dt);
+    // 그림자: 화면 범위만 담도록 해를 따라 옮긴다
+    const sh = this.sun.shadow.camera, ext = half * asp * 1.25 + 40;
+    sh.left = -ext; sh.right = ext; sh.top = ext; sh.bottom = -ext; sh.updateProjectionMatrix();
+    this.sun.target.position.set(this.camTarget.x, 0, this.camTarget.z);
+    this.sun.position.set(this.camTarget.x - 160, 420, this.camTarget.z + 380);
+    // 사거리 표시: 적이 가까이 있을 때만
+    const pp = this.player;
+    const close = this.parked == null && !pp.dead && this.enemies.some(e => !e.dead && Math.hypot(e.x - pp.x, e.z - pp.z) < FIRE_RANGE * 1.6);
+    this.rangeRing.position.set(pp.x, 0.5, pp.z);
+    this.rangeRing.material.opacity = lerp(this.rangeRing.material.opacity, close ? 0.22 + Math.sin(this.t * 3) * 0.05 : 0, dt * 4);
   }
 
   updateAmbience(dt) {

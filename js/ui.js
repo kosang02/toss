@@ -336,12 +336,18 @@ export class UI {
         <p><b>강화</b> 선체는 10레벨까지, 나머지는 선체 레벨×5까지 올릴 수 있습니다.</p>
       </div>
       <div class="btns col">
+        <button class="btn" data-a="quality">그래픽: ${g.low ? '저화질 (빠름)' : '고화질'} — 바꾸기</button>
         <button class="btn" data-a="export">저장 데이터 복사</button>
         <button class="btn" data-a="import">저장 데이터 붙여넣기</button>
         <button class="btn danger" data-a="reset">처음부터 다시</button>
         <button class="btn primary" data-a="ok">닫기</button>
       </div>`);
     box.querySelector('[data-a=ok]').onclick = () => this.closeModal();
+    box.querySelector('[data-a=quality]').onclick = () => {
+      try { localStorage.setItem('dokdo-quality', g.low ? 'high' : 'low'); } catch (e) { /* */ }
+      g.save();
+      location.reload();
+    };
     box.querySelector('[data-a=export]').onclick = () => {
       const code = g.exportSave();
       const b = this.modal(`<h2>저장 데이터</h2><p class="sub">복사해 두면 다른 기기에서 이어서 할 수 있습니다.</p><textarea readonly>${code}</textarea><div class="btns"><button class="btn" data-a="copy">복사</button><button class="btn primary" data-a="ok">닫기</button></div>`);
