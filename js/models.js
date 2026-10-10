@@ -38,11 +38,11 @@ function canvasTex(w, h, draw) {
 const texCache = new Map();
 // 깃발 문장 6종 (0~4 세력, 5 해적). 원작 디자인이 아닌 새 디자인
 export const EMBLEMS = [
-  { sail: 0xf4f1e6, ink: '#22a344', name: '잎새' },
-  { sail: 0xf4f1e6, ink: '#1593c9', name: '닻' },
-  { sail: 0xe8d6a8, ink: '#a8641c', name: '태양' },
-  { sail: 0xdff3fb, ink: '#3aa7c9', name: '눈꽃' },
-  { sail: 0xfbeef6, ink: '#e055b5', name: '꽃' },
+  { sail: 0xe3d7b8, ink: '#1f7a35', name: '잎새' },
+  { sail: 0xe3d7b8, ink: '#155f8a', name: '닻' },
+  { sail: 0xd4bb88, ink: '#7a3e0e', name: '태양' },
+  { sail: 0xcfdde0, ink: '#1f6f8f', name: '눈꽃' },
+  { sail: 0xe6d4cc, ink: '#a8327e', name: '꽃' },
   { sail: 0x1d1d22, ink: '#e9e6dc', name: '해골' },
 ];
 function drawEmblem(g, n, bg) {
@@ -357,11 +357,11 @@ export function makeShip(o) {
 
 // 선체/돛/선회 레벨로 배 모양을 정한다 (원작 구조를 따름)
 const HULL_STYLE = [
-  { hull: 0x9a6b3c, band: null, trim: 0x6b4423 },
-  { hull: 0x9a6b3c, band: null, trim: 0x6b4423 },
-  { hull: 0x8b5a2b, band: null, trim: 0xc9a046 },
-  { hull: 0x8b5a2b, band: 0x1e2340, trim: 0xe8c02e },
-  { hull: 0x8b5a2b, band: 0x1e2340, trim: 0xe8c02e },
+  { hull: 0x7a5232, band: null, trim: 0x4e3018 },
+  { hull: 0x7a5232, band: null, trim: 0x4e3018 },
+  { hull: 0x6e4728, band: null, trim: 0xc9a046 },
+  { hull: 0x6a4224, band: 0x1a1d33, trim: 0xe8c02e },
+  { hull: 0x6a4224, band: 0x1a1d33, trim: 0xe8c02e },
   { hull: 0x7a4e2b, band: 0x2a3a6b, trim: 0xe8c02e },
   { hull: 0x7a4e2b, band: 0x2a3a6b, trim: 0xf2c230 },
   { hull: 0x6e4526, band: 0x3a2f5c, trim: 0xf2c230 },
@@ -590,11 +590,11 @@ export function makeIsland(def) {
   const top = 5;
   const segs = 11;
   const grassCol = def.ground ?? (def.deco === 'ice' ? 0xe8f2f7 : def.deco === 'volcano' ? 0x6b7a3a : def.deco === 'skull' ? 0x7f8f5a : def.deco === 'dokdo' ? 0x5f9a45 : 0x5cb848);
-  const dirtCol = def.deco === 'ice' ? 0xa9cfe0 : 0x8a6a45;
+  const dirtCol = def.deco === 'ice' ? 0x8fb4c6 : 0x5e4430;
   const base = new THREE.Mesh(jitterRadial(new THREE.CylinderGeometry(R, R * 1.06, 7, segs), hashStr(def.id), 0.12), [mat(dirtCol), mat(grassCol), mat(dirtCol)]);
   base.position.y = top - 3.5;
   g.add(base);
-  const sand = mesh(jitterRadial(new THREE.CylinderGeometry(R * 1.1, R * 1.22, 2.2, segs), hashStr(def.id), 0.12), mat(def.deco === 'ice' ? 0xd2e8f2 : 0xe9d79c), 0, 0.3, 0);
+  const sand = mesh(jitterRadial(new THREE.CylinderGeometry(R * 1.1, R * 1.22, 2.2, segs), hashStr(def.id), 0.12), mat(def.deco === 'ice' ? 0xc4dbe6 : 0xcfb87e), 0, 0.3, 0);
   g.add(sand);
 
   // 부두: 섬 남쪽

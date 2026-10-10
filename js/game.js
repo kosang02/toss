@@ -182,17 +182,17 @@ export class Game {
     M.setLowQuality(this.low);
     if (this.low) this.renderer.setPixelRatio(1);
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.15;
+    this.renderer.toneMappingExposure = 0.92;
     this.renderer.shadowMap.enabled = !this.low;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x1d6a93);
+    this.scene.background = new THREE.Color(0x082a44);
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 4000);
     this.camSize = 15;
     this.camSizeTarget = 15;
 
-    this.scene.add(new THREE.HemisphereLight(0xe6f4ff, 0x2a5a78, 1.25));
-    const sun = new THREE.DirectionalLight(0xfff4e0, 2.2);
+    this.scene.add(new THREE.HemisphereLight(0xbcd6ef, 0x13304a, 0.85));
+    const sun = new THREE.DirectionalLight(0xffdcae, 2.6);
     sun.position.set(-20, 39.2, 35.4); // 원작: 남쪽 위에서 45도
     sun.castShadow = !this.low;
     sun.shadow.mapSize.set(2048, 2048);
@@ -341,7 +341,7 @@ export class Game {
     for (const t of [noise, caus]) t.wrapS = t.wrapT = THREE.RepeatWrapping;
     const geo = new THREE.PlaneGeometry(size, size);
     geo.rotateX(-Math.PI / 2);
-    this.waterU = { time: { value: 0 }, tNoise: { value: noise }, tCaus: { value: caus }, deep: { value: new THREE.Color(0x14639a) }, shallow: { value: new THREE.Color(0x45b2d8) }, alpha: { value: 0.87 } };
+    this.waterU = { time: { value: 0 }, tNoise: { value: noise }, tCaus: { value: caus }, deep: { value: new THREE.Color(0x0a3a62) }, shallow: { value: new THREE.Color(0x1f7aa6) }, alpha: { value: 0.87 } };
     this.water = new THREE.Mesh(geo, new THREE.ShaderMaterial({
       uniforms: this.waterU, transparent: true,
       vertexShader: `varying vec2 vW; void main(){ vec4 w = modelMatrix*vec4(position,1.0); vW = w.xz; gl_Position = projectionMatrix*viewMatrix*w; }`,
@@ -355,7 +355,7 @@ export class Game {
           float c2 = texture2D(tCaus, uv*1.6 - vec2(time*0.024, -time*0.016) - d*2.0).a;
           float caus = min(c1, c2) * 1.6 + (c1 + c2) * 0.18;
           vec3 col = mix(deep, shallow, smoothstep(0.42, 0.62, (n1 + n2) * 0.5));
-          col += caus * 0.45;
+          col += caus * 0.34;
           float glint = pow(max(0.0, sin(vW.x*0.35 + time*2.3) * sin(vW.y*0.31 - time*1.9)), 60.0) * smoothstep(0.5, 0.7, n2);
           col += glint * 0.9;
           gl_FragColor = vec4(col, alpha);
@@ -366,7 +366,7 @@ export class Game {
     this.water.renderOrder = 1;
     this.scene.add(this.water);
     // 바다 위 그림자
-    this.shadowCatcher = new THREE.Mesh(geo, new THREE.ShadowMaterial({ opacity: 0.22, depthWrite: false }));
+    this.shadowCatcher = new THREE.Mesh(geo, new THREE.ShadowMaterial({ opacity: 0.32, depthWrite: false }));
     this.shadowCatcher.position.y = 0.2;
     this.shadowCatcher.receiveShadow = true;
     this.shadowCatcher.renderOrder = 2;
@@ -383,7 +383,7 @@ export class Game {
     const ctex = M.cloudShadowTexture();
     for (let i = 0; i < 6; i++) {
       const sz = rand(260, 520);
-      const c = new THREE.Mesh(new THREE.PlaneGeometry(sz, sz * rand(0.6, 0.9)), new THREE.MeshBasicMaterial({ map: ctex, transparent: true, opacity: 0.32, depthWrite: false, color: 0x062a44 }));
+      const c = new THREE.Mesh(new THREE.PlaneGeometry(sz, sz * rand(0.6, 0.9)), new THREE.MeshBasicMaterial({ map: ctex, transparent: true, opacity: 0.4, depthWrite: false, color: 0x021626 }));
       c.rotation.x = -Math.PI / 2;
       c.rotation.z = rand(0, TAU);
       c.position.set(rand(-900, 900), 0.4, rand(-900, 900));

@@ -30,11 +30,11 @@ export const FISH_R = 40 * K;             // 낚시 가능
 export const FOG_R = 150 * K;
 
 export const FACTIONS = [
-  { name: '초록', color: '#22bb44', ground: 0x5cb848 },
-  { name: '파랑', color: '#00ccff', ground: 0x4fb06a },
-  { name: '사막', color: '#aa7722', ground: 0xd9c27a },
-  { name: '얼음', color: '#bbffff', ground: 0xe8f2f7 },
-  { name: '핑크', color: '#ff88ff', ground: 0x7cc46a },
+  { name: '초록', color: '#22bb44', ground: 0x3f8a34 },
+  { name: '파랑', color: '#00ccff', ground: 0x357f4c },
+  { name: '사막', color: '#aa7722', ground: 0xb8975a },
+  { name: '얼음', color: '#bbffff', ground: 0xc7d9e2 },
+  { name: '핑크', color: '#ff88ff', ground: 0x4f8d40 },
 ];
 export const PLAYER_MAP_COLOR = '#961a1a';
 
